@@ -1,3 +1,4 @@
+use crate::brand;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, bounded};
 use eframe::egui;
@@ -102,21 +103,12 @@ impl State {
 
     fn icon(self) -> Icon {
         let color = match self {
-            Self::Standby => [135, 157, 185, 255],
+            Self::Standby => brand::STANDBY,
             Self::Isolating => [87, 220, 184, 255],
             Self::NeedsAttention => [255, 171, 94, 255],
         };
-        let heights = [5, 12, 20, 12, 5];
-        let mut pixels = vec![0; 32 * 32 * 4];
-        for (bar, height) in heights.into_iter().enumerate() {
-            for y in (32 - height) / 2..(32 + height) / 2 {
-                for x in 4 + bar * 5..7 + bar * 5 {
-                    let at = (y * 32 + x) * 4;
-                    pixels[at..at + 4].copy_from_slice(&color);
-                }
-            }
-        }
-        Icon::from_rgba(pixels, 32, 32).expect("valid tray icon dimensions")
+        Icon::from_rgba(brand::waveform(color), brand::SIZE, brand::SIZE)
+            .expect("valid tray icon dimensions")
     }
 }
 

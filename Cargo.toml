@@ -16,10 +16,19 @@ name = "voiceisolator_live"
 path = "rust/desktop.rs"
 required-features = ["desktop"]
 
+[[bin]]
+name = "voiceisolator_engine"
+path = "rust/engine_main.rs"
+required-features = ["desktop"]
+
 [features]
 default = ["desktop"]
 desktop = ["dep:eframe", "dep:minisign-verify", "dep:tray-icon", "windows/Win32_Networking_WinHttp"]
 cpu-only = []
+
+[build-dependencies]
+embed-resource = "=3.0.12"
+image = { version = "0.25.10", default-features = false, features = ["ico"] }
 
 [dependencies]
 anyhow = "1.0.104"

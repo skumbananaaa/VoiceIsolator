@@ -14,7 +14,7 @@ See [release instructions](docs/release.md) for building and signing the install
 
 ## Open the desktop app
 
-Open **voiceisolator_live.exe** in `out/windows-x64-pcm/Release`. Keep it beside the matching DLLs. The live target uses the PCM SDK and matching VoxLock 1.2.0 models. It reads the pinned development model folder or a `models` folder beside the executable.
+Open **voiceisolator_live.exe** in `out/windows-x64-pcm/Release`. Keep it beside `voiceisolator_engine.exe` and the matching DLLs. The live target uses the PCM SDK and matching VoxLock 1.2.0 models. It reads the pinned development model folder or a `models` folder beside the executable.
 
 1. Install VB-CABLE separately and reboot as directed by its installer. [VB-CABLE download](https://vb-audio.com/Cable/)
 2. Open VoiceIsolator Live. It restores your microphone and virtual cable choices when available. On first use it prefers your Windows communications microphone and the standard VB-CABLE **CABLE Input**. Check the selections and use **Refresh devices** after connecting hardware.

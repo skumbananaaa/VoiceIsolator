@@ -32,6 +32,7 @@ LicenseFile={#Payload}\licenses\Microsoft-VC-Runtime-License.txt
 
 [Files]
 Source: "{#Payload}\voiceisolator_live.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#Payload}\voiceisolator_engine.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Payload}\sherpa-onnx-c-api.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Payload}\onnxruntime.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Payload}\onnxruntime_providers_shared.dll"; DestDir: "{app}"; Flags: ignoreversion

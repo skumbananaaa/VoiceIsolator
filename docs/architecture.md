@@ -48,7 +48,7 @@ sequenceDiagram
     Rec->>Rec: Capture 6 s, select 3 s
     Rec->>Profile: Encrypt PCM and mic ID
     Rec-->>UI: Profile saved
-    UI->>Engine: Launch --engine and send Start
+    UI->>Engine: Launch audio worker and send Start
     Engine->>Profile: Decrypt and check mic ID
     alt Profile missing, invalid, or for another mic
         Engine-->>UI: Fault, route stays closed
@@ -68,7 +68,7 @@ sequenceDiagram
 
 ## Session changes and recovery
 
-[`Session`](../rust/engine.rs) launches the same executable with `--engine` and supervises it through newline-delimited JSON on stdin and stdout. Gain changes update the running worker. Changing the cable, backend, batch size, CPU threads, or clock correction stops the old child before launching a replacement. Changing the microphone or enrolling again requires stopping isolation.
+[`Session`](../rust/engine.rs) launches `voiceisolator_engine.exe` and supervises it through newline-delimited JSON on stdin and stdout. Applying processing changes stops the old child before launching a replacement. Changing the microphone or enrolling again requires stopping isolation.
 
 Within the child, capture gaps, endpoint failures, or queue overflow can end an attempt to run the route. The inference worker gives render up to 20 ms to free space before treating a full output queue as a fault. Recovery discards both queues, resets the model stream, and reopens the selected endpoints; repeated failures stop the route. If the child stops making progress, the desktop watchdog can end the process. A Windows Job Object also ties the child to the desktop's lifetime.
 

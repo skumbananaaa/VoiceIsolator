@@ -36,7 +36,9 @@ try {
     & "$PSScriptRoot/build-rust.ps1" -OptimizedSdk -CpuOnly -Test -NoStage -Offline:$Offline
 
     New-Item -ItemType Directory -Path (Join-Path $payload 'models') -Force | Out-Null
-    Copy-Item -LiteralPath (Join-Path $cargoOutput 'voiceisolator_live.exe') -Destination $payload
+    foreach ($file in @('voiceisolator_live.exe', 'voiceisolator_engine.exe')) {
+        Copy-Item -LiteralPath (Join-Path $cargoOutput $file) -Destination $payload
+    }
     foreach ($file in @('sherpa-onnx-c-api.dll', 'onnxruntime.dll', 'onnxruntime_providers_shared.dll')) {
         Copy-Item -LiteralPath (Join-Path $sdk $file) -Destination $payload
     }

@@ -7,7 +7,7 @@ Start with the [architecture guide](architecture.md) for the live audio path and
 | If you are changing… | Start here |
 | --- | --- |
 | The desktop UI, device pickers, or enrollment controls | [`rust/desktop.rs`](../rust/desktop.rs), the `voiceisolator_live.exe` entry point |
-| The child process, control messages, or live batch scheduling | [`rust/engine.rs`](../rust/engine.rs), reached through `voiceisolator_live.exe --engine` |
+| The child process, control messages, or live batch scheduling | [`rust/engine.rs`](../rust/engine.rs), reached through `voiceisolator_engine.exe` |
 | Endpoint discovery, capture, render, or enrollment selection | [`rust/wasapi.rs`](../rust/wasapi.rs) |
 | Queues, playback buffering, or clock correction | [`rust/playback.rs`](../rust/playback.rs) |
 | Model loading, speaker conditioning, or streaming inference | [`rust/isolation.rs`](../rust/isolation.rs) and [`rust/cuda.rs`](../rust/cuda.rs) |
@@ -15,7 +15,7 @@ Start with the [architecture guide](architecture.md) for the live audio path and
 | Live latency measurement | [`rust/latency.rs`](../rust/latency.rs) |
 | Offline isolation, timing reports, or WAV handling | [`rust/cli.rs`](../rust/cli.rs), the `voiceisolator.exe` entry point, and [`rust/wav.rs`](../rust/wav.rs) |
 
-[`Cargo.toml`](../Cargo.toml) declares both binaries and the shared library in [`rust/lib.rs`](../rust/lib.rs). The default `desktop` feature enables the egui application. The VoxLock source submodule is an upstream reference; the Rust build links the separately pinned sherpa-onnx SDK.
+[`Cargo.toml`](../Cargo.toml) declares the CLI, desktop, audio worker, and shared library in [`rust/lib.rs`](../rust/lib.rs). The default `desktop` feature enables the egui application and its audio worker. The VoxLock source submodule is an upstream reference; the Rust build links the separately pinned sherpa-onnx SDK.
 
 ## Build and runtime dependencies
 
@@ -40,7 +40,7 @@ flowchart TD
 ```
 
 - [`cmake/Dependencies.cmake`](../cmake/Dependencies.cmake) pins the native SDK revision and downloaded assets. [`scripts/fetch-deps.cmake`](../scripts/fetch-deps.cmake) fetches and verifies models and optional assets. [`scripts/build-pcm-sdk.ps1`](../scripts/build-pcm-sdk.ps1) builds the pinned sherpa-onnx source and writes an SDK pin marker.
-- [`build.rs`](../build.rs) requires Windows x64 MSVC, checks the SDK marker, passes model pins to the Rust compiler, and links the sherpa-onnx and ONNX Runtime import libraries. [`scripts/build-rust.ps1`](../scripts/build-rust.ps1) builds both binaries and puts their DLLs beside them. The `-Cuda` switch stages the CUDA-enabled ONNX Runtime package in the same output directory.
+- [`build.rs`](../build.rs) requires Windows x64 MSVC, checks the SDK marker, passes model pins to the Rust compiler, and links the sherpa-onnx and ONNX Runtime import libraries. It embeds the app icon and Windows display names. [`scripts/build-rust.ps1`](../scripts/build-rust.ps1) stages the binaries and runtime DLLs together. The `-Cuda` switch stages the CUDA-enabled ONNX Runtime package in the same output directory.
 - The desktop first looks for a `models/` directory beside its executable. If that directory is absent, it looks in `.deps/models/voxlock-v2` under the build's source checkout. The CLI takes its model directory from `--models`. Models stay outside the executables and are verified when opened.
 
 Follow the [README build commands](../README.md#open-the-desktop-app) for a fresh checkout and the [CUDA instructions](../README.md#enable-cuda) for GPU setup.

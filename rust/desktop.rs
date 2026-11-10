@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod brand;
 mod desktop_shell;
 mod updates;
 
@@ -47,6 +48,11 @@ fn main() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([784.0, 754.0])
             .with_min_inner_size([580.0, 540.0])
+            .with_icon(egui::IconData {
+                rgba: brand::waveform(brand::STANDBY),
+                width: brand::SIZE,
+                height: brand::SIZE,
+            })
             .with_active(!startup)
             .with_visible(!startup),
         renderer: eframe::Renderer::Glow,

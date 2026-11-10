@@ -8,8 +8,7 @@ use std::{
 #[test]
 fn child_reports_missing_profile_before_opening_devices() -> anyhow::Result<()> {
     let app_data = tempfile::tempdir()?;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_voiceisolator_live"))
-        .arg("--engine")
+    let mut child = Command::new(env!("CARGO_BIN_EXE_voiceisolator_engine"))
         .env("LOCALAPPDATA", app_data.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -193,13 +193,21 @@ pub struct Session {
 impl Session {
     pub fn launch(config: Config) -> Result<Self> {
         let job = Job::new()?;
-        let mut child = Command::new(std::env::current_exe()?)
-            .arg("--engine")
+        let desktop = std::env::current_exe()?;
+        let worker = desktop.with_file_name("voiceisolator_engine.exe");
+        let mut command = Command::new(&worker);
+        if !worker.is_file() && !desktop.with_file_name("installed-release").is_file() {
+            // Cargo can build just the desktop target during development.
+            command = Command::new(desktop);
+            command.arg("--engine");
+        }
+        let mut child = command
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .spawn()?;
+            .spawn()
+            .context("Could not launch the VoiceIsolator audio engine")?;
         if let Err(error) =
             unsafe { AssignProcessToJobObject(job.0, HANDLE(child.as_raw_handle())) }
         {

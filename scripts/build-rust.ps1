@@ -29,7 +29,7 @@ if ($Cuda) {
     $runtimeDlls += $cudaDll
 }
 $sherpaDll = 'sherpa-onnx-c-api.dll'
-$bins = @('voiceisolator.exe', 'voiceisolator_live.exe')
+$bins = @('voiceisolator.exe', 'voiceisolator_live.exe', 'voiceisolator_engine.exe')
 $oldPath = $env:Path
 $oldTarget = $env:CARGO_TARGET_DIR
 $oldSdk = $env:VOICEISOLATOR_SHERPA_SDK_DIR
@@ -108,9 +108,10 @@ try {
     if ($NoStage) { return }
     New-Item -ItemType Directory -Force -Path $output | Out-Null
     if ($CloseRunningApp) {
-        $exe = Join-Path (Resolve-Path -LiteralPath $output).Path 'voiceisolator_live.exe'
-        $running = @(Get-Process -Name 'voiceisolator_live' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -eq $exe })
+        $outputPath = (Resolve-Path -LiteralPath $output).Path
+        $appPaths = @('voiceisolator_live.exe', 'voiceisolator_engine.exe') | ForEach-Object { Join-Path $outputPath $_ }
+        $running = @(Get-Process -Name 'voiceisolator_live', 'voiceisolator_engine' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -in $appPaths })
         $quitEvent = $null
         if ($running.Count -gt 0 -and [Threading.EventWaitHandle]::TryOpenExisting('Local\VoiceIsolator-Quit-v1', [ref]$quitEvent)) {
             try { [void]$quitEvent.Set() } finally { $quitEvent.Dispose() }
