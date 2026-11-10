@@ -379,15 +379,19 @@ impl Desktop {
         self.update_message = Some("Checking for updates…".into());
     }
 
-    fn install_update(&mut self, ctx: &egui::Context) {
-        if self.session.is_some()
+    fn installable_update(&self) -> Option<&updates::Release> {
+        if self.quitting
             || self.recording.is_some()
             || self.resume_until.is_some()
             || self.update_task.is_some()
         {
-            return;
+            return None;
         }
-        let Some(release) = self.update_available.clone() else {
+        self.update_available.as_ref()
+    }
+
+    fn install_update(&mut self, ctx: &egui::Context) {
+        let Some(release) = self.installable_update().cloned() else {
             return;
         };
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1136,9 +1140,10 @@ impl eframe::App for Desktop {
                                     cancel.store(true, Relaxed);
                                 }
                             } else if self.update_available.is_some() && self.update_task.is_none() {
-                                let available = self.session.is_none() && self.recording.is_none() && self.resume_until.is_none();
-                                if ui.add_enabled(available, egui::Button::new("Install update"))
-                                    .on_disabled_hover_text("Stop isolation and recording before installing an update.").clicked() {
+                                if ui.add_enabled(self.installable_update().is_some(), egui::Button::new("Install update"))
+                                    .on_hover_text("Isolation continues during the download and stops when Setup opens.")
+                                    .on_disabled_hover_text("Wait for recording or startup to finish before installing an update.")
+                                    .clicked() {
                                     self.install_update(ui.ctx());
                                 }
                             }
