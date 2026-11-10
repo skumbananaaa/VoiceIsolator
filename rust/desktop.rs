@@ -1201,7 +1201,11 @@ fn accent(dark: bool) -> Color32 {
 }
 
 fn theme(ctx: &egui::Context, dark: bool) {
-    let mut style = (*ctx.global_style()).clone();
+    let mode = if dark {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    };
     let mut visuals = if dark {
         egui::Visuals::dark()
     } else {
@@ -1237,10 +1241,13 @@ fn theme(ctx: &egui::Context, dark: bool) {
     } else {
         Color32::from_rgb(177, 222, 211)
     };
-    style.visuals = visuals;
-    style.spacing.item_spacing = vec2(9.0, 7.0);
-    style.spacing.button_padding = vec2(11.0, 5.0);
-    ctx.set_global_style(style);
+    ctx.style_mut_of(mode, |style| {
+        style.visuals = visuals;
+        style.spacing.item_spacing = vec2(9.0, 7.0);
+        style.spacing.button_padding = vec2(11.0, 5.0);
+    });
+    ctx.set_theme(mode);
+    ctx.request_repaint();
 }
 
 fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
@@ -1428,5 +1435,40 @@ fn meter(ui: &mut egui::Ui, label: &str, level: f32, color: Color32) {
         let empty = ui.visuals().widgets.inactive.weak_bg_fill;
         ui.painter()
             .rect_filled(segment, 2, empty.lerp_to_gamma(color, partial));
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+    #[test]
+    fn selected_theme_wins_over_windows_on_startup_and_toggle() {
+        let ctx = egui::Context::default();
+        for (dark, selected, system, panel_fill) in [
+            (
+                true,
+                egui::Theme::Dark,
+                egui::Theme::Light,
+                Color32::from_rgb(15, 23, 36),
+            ),
+            (
+                false,
+                egui::Theme::Light,
+                egui::Theme::Dark,
+                Color32::from_rgb(241, 246, 250),
+            ),
+        ] {
+            theme(&ctx, dark);
+            let input = egui::RawInput {
+                system_theme: Some(system),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                assert_eq!(ui.ctx().theme(), selected);
+                assert_eq!(ui.visuals().dark_mode, dark);
+                assert_eq!(ui.visuals().panel_fill, panel_fill);
+            });
+        }
     }
 }
