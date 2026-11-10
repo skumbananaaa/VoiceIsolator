@@ -1,0 +1,3 @@
+[submodule "voxlock"]
+	path = third_party/voxlock
+	url = https://github.com/arbazsiddiqui/voxlock.git

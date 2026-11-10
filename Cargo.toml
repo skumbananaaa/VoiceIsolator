@@ -1,0 +1,50 @@
+[package]
+name = "voiceisolator"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+path = "rust/lib.rs"
+
+[[bin]]
+name = "voiceisolator"
+path = "rust/cli.rs"
+
+[[bin]]
+name = "voiceisolator_live"
+path = "rust/desktop.rs"
+required-features = ["desktop"]
+
+[features]
+default = ["desktop"]
+desktop = ["dep:eframe", "dep:minisign-verify", "dep:tray-icon", "windows/Win32_Networking_WinHttp"]
+cpu-only = []
+
+[dependencies]
+anyhow = "1.0.104"
+crossbeam-channel = "0.5.17"
+ort-sys = { version = "=2.0.0-rc.15", default-features = false, features = ["api-28", "disable-linking"] }
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "accesskit"], optional = true }
+minisign-verify = { version = "=0.2.5", optional = true }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+tempfile = "3.27.0"
+tray-icon = { version = "0.26.1", default-features = false, optional = true }
+windows = { version = "0.62.2", features = [
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Multimedia",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_JobObjects",
+    "Win32_System_Performance",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }

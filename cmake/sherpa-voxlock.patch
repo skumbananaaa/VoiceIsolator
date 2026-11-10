@@ -1,0 +1,370 @@
+diff --git a/sherpa-onnx/c-api/c-api.cc b/sherpa-onnx/c-api/c-api.cc
+index cff5952..7b84575 100644
+--- a/sherpa-onnx/c-api/c-api.cc
++++ b/sherpa-onnx/c-api/c-api.cc
+@@ -2992,21 +2992,20 @@ struct SherpaOnnxOfflineSpeechDenoiser {
+   std::unique_ptr<sherpa_onnx::OfflineSpeechDenoiser> impl;
+ };
+ 
+-static const SherpaOnnxDenoisedAudio *CreateDenoisedAudio(
+-    const sherpa_onnx::DenoisedAudio &audio) {
+-  auto ans = new SherpaOnnxDenoisedAudio;
+-
+-  float *denoised_samples = nullptr;
+-  if (!audio.samples.empty()) {
+-    denoised_samples = new float[audio.samples.size()];
+-    std::copy(audio.samples.begin(), audio.samples.end(), denoised_samples);
++struct OwnedDenoisedAudio : SherpaOnnxDenoisedAudio {
++  explicit OwnedDenoisedAudio(sherpa_onnx::DenoisedAudio &&audio)
++      : storage(std::move(audio.samples)) {
++    samples = storage.empty() ? nullptr : storage.data();
++    n = storage.size();
++    sample_rate = audio.sample_rate;
+   }
+ 
+-  ans->samples = denoised_samples;
+-  ans->n = audio.samples.size();
+-  ans->sample_rate = audio.sample_rate;
++  std::vector<float> storage;
++};
+ 
+-  return ans;
++static const SherpaOnnxDenoisedAudio *CreateDenoisedAudio(
++    sherpa_onnx::DenoisedAudio &&audio) {
++  return new OwnedDenoisedAudio(std::move(audio));
+ }
+ 
+ static sherpa_onnx::OfflineSpeechDenoiserConfig GetOfflineSpeechDenoiserConfig(
+@@ -3108,13 +3107,11 @@ const SherpaOnnxDenoisedAudio *SherpaOnnxOfflineSpeechDenoiserRun(
+   }
+ 
+   auto audio = sd->impl->Run(samples, n, sample_rate);
+-  return CreateDenoisedAudio(audio);
++  return CreateDenoisedAudio(std::move(audio));
+ }
+ 
+ void SherpaOnnxDestroyDenoisedAudio(const SherpaOnnxDenoisedAudio *p) {
+-  if (!p) return;
+-  delete[] p->samples;
+-  delete p;
++  delete static_cast<const OwnedDenoisedAudio *>(p);
+ }
+ 
+ // =========================================================================
+@@ -3343,7 +3340,7 @@ const SherpaOnnxDenoisedAudio *SherpaOnnxOnlineSpeechDenoiserRun(
+     return nullptr;
+   }
+ 
+-  return CreateDenoisedAudio(audio);
++  return CreateDenoisedAudio(std::move(audio));
+ }
+ 
+ const SherpaOnnxDenoisedAudio *SherpaOnnxOnlineSpeechDenoiserFlush(
+@@ -3358,7 +3355,7 @@ const SherpaOnnxDenoisedAudio *SherpaOnnxOnlineSpeechDenoiserFlush(
+     return nullptr;
+   }
+ 
+-  return CreateDenoisedAudio(audio);
++  return CreateDenoisedAudio(std::move(audio));
+ }
+ 
+ void SherpaOnnxOnlineSpeechDenoiserReset(
+diff --git a/sherpa-onnx/csrc/offline-speech-denoiser-voxlock-model.cc b/sherpa-onnx/csrc/offline-speech-denoiser-voxlock-model.cc
+index b458015..cd3e058 100644
+--- a/sherpa-onnx/csrc/offline-speech-denoiser-voxlock-model.cc
++++ b/sherpa-onnx/csrc/offline-speech-denoiser-voxlock-model.cc
+@@ -4,7 +4,9 @@
+ 
+ #include "sherpa-onnx/csrc/offline-speech-denoiser-voxlock-model.h"
+ 
++#include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cmath>
+ #include <memory>
+ #include <sstream>
+@@ -172,6 +174,24 @@ class OfflineSpeechDenoiserVoxLockModel::Impl {
+         {}, chunk_input_names_ptr_.data(), inputs.data(), inputs.size(),
+         chunk_output_names_ptr_.data(), chunk_output_names_ptr_.size());
+ 
++    if (report_boundary_.load(std::memory_order_relaxed) &&
++        report_boundary_.exchange(false, std::memory_order_relaxed)) {
++      const auto expected_inputs = chunk_sess_->GetMemoryInfoForInputs();
++      const auto expected_outputs = chunk_sess_->GetMemoryInfoForOutputs();
++      for (size_t i = 0; i < inputs.size(); ++i) {
++        SHERPA_ONNX_LOGE("VoxLock chunk input %s: %zu bytes, %s -> %s",
++                         chunk_input_names_ptr_[i], inputs[i].GetTensorSizeInBytes(),
++                         inputs[i].GetTensorMemoryInfo().GetAllocatorName().c_str(),
++                         expected_inputs[i].GetAllocatorName().c_str());
++      }
++      for (size_t i = 0; i < out.size(); ++i) {
++        SHERPA_ONNX_LOGE("VoxLock chunk output %s: %zu bytes, %s -> %s",
++                         chunk_output_names_ptr_[i], out[i].GetTensorSizeInBytes(),
++                         expected_outputs[i].GetAllocatorName().c_str(),
++                         out[i].GetTensorMemoryInfo().GetAllocatorName().c_str());
++      }
++    }
++
+     States next_states;
+     next_states.reserve(out.size() - 1);
+     for (int32_t k = 1; k < static_cast<int32_t>(out.size()); ++k) {
+@@ -181,6 +201,56 @@ class OfflineSpeechDenoiserVoxLockModel::Impl {
+     return {std::move(out[0]), std::move(next_states)};
+   }
+ 
++  bool UseBoundChunk() const { return bind_chunk_; }
++
++  std::pair<Ort::Value, States> RunBound(Ort::Value wav, const Voice &voice,
++                                        States states, int32_t num_frames,
++                                        BoundChunk *bound) const {
++    if (report_boundary_.load(std::memory_order_relaxed) &&
++        report_boundary_.exchange(false, std::memory_order_relaxed)) {
++      SHERPA_ONNX_LOGE("VoxLock chunk uses CUDA I/O binding for conditioning and recurrent states.");
++    }
++    if (!bound->binding) {
++      bound->binding = std::make_unique<Ort::IoBinding>(*chunk_sess_);
++      for (size_t i = 0; i < voice.size(); ++i) {
++        bound->binding->BindInput(chunk_input_names_ptr_[1 + i], voice[i]);
++      }
++    }
++    auto &binding = *bound->binding;
++    binding.BindInput(chunk_input_names_ptr_[0], wav);
++    auto cpu = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
++    std::array<int64_t, 3> frames_shape{1, num_frames, meta_.n_fft};
++    bound->frames.resize(static_cast<size_t>(num_frames) * meta_.n_fft);
++    auto frames = Ort::Value::CreateTensor(cpu, bound->frames.data(),
++        bound->frames.size(), frames_shape.data(), frames_shape.size());
++    binding.BindOutput(chunk_output_names_ptr_[0], frames);
++    for (size_t i = 0; i < states.size(); ++i) {
++      binding.BindInput(chunk_input_names_ptr_[1 + voice.size() + i], states[i]);
++      if (bound->spare.empty()) {
++        binding.BindOutput(chunk_output_names_ptr_[1 + i], state_output_memory_[i]);
++      } else {
++        binding.BindOutput(chunk_output_names_ptr_[1 + i], bound->spare[i]);
++      }
++    }
++
++    binding.SynchronizeInputs();
++    chunk_sess_->Run(Ort::RunOptions{}, binding);
++    binding.SynchronizeOutputs();
++    States next_states = std::move(bound->spare);
++    if (next_states.empty()) {
++      auto out = binding.GetOutputValues();
++      next_states.reserve(out.size() - 1);
++      for (size_t i = 1; i < out.size(); ++i) {
++        next_states.push_back(std::move(out[i]));
++      }
++    }
++    if (bound->states_on_device) {
++      bound->spare = std::move(states);
++    }
++    bound->states_on_device = true;
++    return {std::move(frames), std::move(next_states)};
++  }
++
+   const OfflineSpeechDenoiserVoxLockModelMetaData &GetMetaData() const {
+     return meta_;
+   }
+@@ -241,8 +311,45 @@ class OfflineSpeechDenoiserVoxLockModel::Impl {
+   }
+ 
+   void InitChunk(void *model_data, size_t model_data_length) {
++    auto options = sess_opts_.Clone();
++    constexpr const char *kProfileKey = "VoiceIsolatorVoxLockProfile";
++    if (options.HasConfigEntry(kProfileKey)) {
++      options.EnableProfiling(
++          SHERPA_ONNX_TO_ORT_PATH(options.GetConfigEntry(kProfileKey)));
++      report_boundary_ = true;
++    }
+     chunk_sess_ = std::make_unique<Ort::Session>(env_, model_data,
+-                                                 model_data_length, sess_opts_);
++                                                 model_data_length, options);
++    const auto binding = options.GetConfigEntryOrDefault(
++        "VoiceIsolatorVoxLockIoBinding", "auto");
++    const bool cuda_requested = config_.provider == "cuda" ||
++                                config_.provider.rfind("cuda:", 0) == 0;
++    if (binding == "1" || (binding == "auto" && cuda_requested)) {
++      const auto inputs = chunk_sess_->GetMemoryInfoForInputs();
++      const auto outputs = chunk_sess_->GetMemoryInfoForOutputs();
++      const auto cuda = [](const Ort::ConstMemoryInfo &info) {
++        return info.GetDeviceType() == OrtMemoryInfoDeviceType_GPU &&
++               info.GetAllocatorName() == "Cuda" && info.GetDeviceId() == 0;
++      };
++      if (inputs.size() >= 4 && outputs.size() == 3 &&
++          std::all_of(inputs.begin() + 1, inputs.end(), cuda) &&
++          std::all_of(outputs.begin() + 1, outputs.end(), cuda)) {
++        const auto output_type = chunk_sess_->GetOutputTypeInfo(0);
++        if (output_type.GetONNXType() == ONNX_TYPE_TENSOR) {
++          const auto tensor = output_type.GetTensorTypeAndShapeInfo();
++          const auto shape = tensor.GetShape();
++          bind_chunk_ = tensor.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
++                        shape.size() == 3 && shape[0] == 1 &&
++                        shape[1] < 0 && shape[2] == meta_.n_fft;
++        }
++      }
++      if (bind_chunk_) {
++        state_output_memory_.assign(outputs.begin() + 1, outputs.end());
++      } else if (binding == "1") {
++        SHERPA_ONNX_LOGE("VoxLock I/O binding requires CUDA-resident conditioning and states and a compatible PCM output shape.");
++        SHERPA_ONNX_EXIT(-1);
++      }
++    }
+ 
+     GetInputNames(chunk_sess_.get(), &chunk_input_names_,
+                   &chunk_input_names_ptr_);
+@@ -386,6 +493,9 @@ class OfflineSpeechDenoiserVoxLockModel::Impl {
+   std::vector<const char *> enroll_output_names_ptr_;
+ 
+   std::unique_ptr<Ort::Session> chunk_sess_;
++  std::vector<Ort::ConstMemoryInfo> state_output_memory_;
++  bool bind_chunk_ = false;
++  mutable std::atomic<bool> report_boundary_{false};
+ 
+   std::vector<std::string> chunk_input_names_;
+   std::vector<const char *> chunk_input_names_ptr_;
+@@ -423,6 +533,18 @@ OfflineSpeechDenoiserVoxLockModel::Run(Ort::Value wav, Voice voice,
+   return impl_->Run(std::move(wav), std::move(voice), std::move(states));
+ }
+ 
++bool OfflineSpeechDenoiserVoxLockModel::UseBoundChunk() const {
++  return impl_->UseBoundChunk();
++}
++
++std::pair<Ort::Value, OfflineSpeechDenoiserVoxLockModel::States>
++OfflineSpeechDenoiserVoxLockModel::RunBound(Ort::Value wav, const Voice &voice,
++                                          States states, int32_t num_frames,
++                                          BoundChunk *bound) const {
++  return impl_->RunBound(std::move(wav), voice, std::move(states), num_frames,
++                         bound);
++}
++
+ const OfflineSpeechDenoiserVoxLockModelMetaData &
+ OfflineSpeechDenoiserVoxLockModel::GetMetaData() const {
+   return impl_->GetMetaData();
+diff --git a/sherpa-onnx/csrc/offline-speech-denoiser-voxlock-model.h b/sherpa-onnx/csrc/offline-speech-denoiser-voxlock-model.h
+index 1dfe519..d14dd73 100644
+--- a/sherpa-onnx/csrc/offline-speech-denoiser-voxlock-model.h
++++ b/sherpa-onnx/csrc/offline-speech-denoiser-voxlock-model.h
+@@ -29,6 +29,14 @@ class OfflineSpeechDenoiserVoxLockModel {
+   // The outputs of the enroll model, in the order the chunk model takes them
+   using Voice = std::vector<Ort::Value>;
+ 
++  // Per-stream state. Bound voice tensors are immutable for the stream's lifetime.
++  struct BoundChunk {
++    std::vector<float> frames;
++    std::unique_ptr<Ort::IoBinding> binding;
++    States spare;
++    bool states_on_device = false;
++  };
++
+   /* Run the enroll model on a voice sample of the caller.
+    *
+    * @param samples Voice sample at GetMetaData().sample_rate. It must have
+@@ -58,6 +66,10 @@ class OfflineSpeechDenoiserVoxLockModel {
+    */
+   std::pair<Ort::Value, States> Run(Ort::Value wav, Voice voice,
+                                     States states) const;
++  bool UseBoundChunk() const;
++  std::pair<Ort::Value, States> RunBound(Ort::Value wav, const Voice &voice,
++                                        States states, int32_t num_frames,
++                                        BoundChunk *bound) const;
+ 
+   const OfflineSpeechDenoiserVoxLockModelMetaData &GetMetaData() const;
+ 
+diff --git a/sherpa-onnx/csrc/online-speech-denoiser-voxlock-impl.h b/sherpa-onnx/csrc/online-speech-denoiser-voxlock-impl.h
+index 8c261e7..5f82457 100644
+--- a/sherpa-onnx/csrc/online-speech-denoiser-voxlock-impl.h
++++ b/sherpa-onnx/csrc/online-speech-denoiser-voxlock-impl.h
+@@ -91,13 +91,13 @@ class OnlineSpeechDenoiserVoxLockImpl : public OnlineSpeechDenoiserImpl {
+     std::vector<float> resampled;
+     if (resampler_) {
+       resampler_->Resample(samples, n, false, &resampled);
+-    } else {
+-      resampled.assign(samples, samples + n);
++      samples = resampled.data();
++      n = resampled.size();
+     }
+ 
+     DenoisedAudio ans;
+     ans.sample_rate = model_sample_rate;
+-    ans.samples = Process(resampled.data(), resampled.size());
++    ans.samples = Process(samples, n);
+     total_output_samples_ += ans.samples.size();
+     return ans;
+   }
+@@ -138,8 +138,12 @@ class OnlineSpeechDenoiserVoxLockImpl : public OnlineSpeechDenoiserImpl {
+       stream_.reset();
+       num_faded_ = 0;
+     } else {
+-      stream_ = std::make_unique<SpeechDenoiserVoxLockStream>(
+-          &model_, voice_sample_.data(), voice_sample_.size());
++      if (stream_) {
++        stream_->Reset();
++      } else {
++        stream_ = std::make_unique<SpeechDenoiserVoxLockStream>(
++            &model_, voice_sample_.data(), voice_sample_.size());
++      }
+       num_faded_ = fade_length_;
+     }
+   }
+diff --git a/sherpa-onnx/csrc/speech-denoiser-voxlock-stream.h b/sherpa-onnx/csrc/speech-denoiser-voxlock-stream.h
+index 9d72f34..dcf37f3 100644
+--- a/sherpa-onnx/csrc/speech-denoiser-voxlock-stream.h
++++ b/sherpa-onnx/csrc/speech-denoiser-voxlock-stream.h
+@@ -251,6 +251,19 @@ class SpeechDenoiserVoxLockStream {
+     }
+   }
+ 
++  // Keep the immutable speaker conditioning when recovering the same stream.
++  void Reset() {
++    bound_ = {};
++    states_ = model_->GetInitStates();
++    head_.clear();
++    buffer_.clear();
++    offset_ = 0;
++    overlap_add_.assign(n_fft_, 0);
++    window_sum_.assign(n_fft_, 0);
++    num_to_drop_ = 0;
++    started_ = false;
++  }
++
+   /* @param samples Audio samples at the model's sample rate
+    * @param n Number of samples
+    *
+@@ -327,15 +340,20 @@ class SpeechDenoiserVoxLockStream {
+           memory_info_, buffer_.data() + offset_, num_samples, wav_shape.data(),
+           wav_shape.size());
+ 
+-      OfflineSpeechDenoiserVoxLockModel::Voice voice;
+-      voice.reserve(voice_.size());
+-      for (auto &v : voice_) {
+-        voice.push_back(View(&v));
+-      }
+-
+       Ort::Value frames{nullptr};
+-      std::tie(frames, states_) =
+-          model_->Run(std::move(wav), std::move(voice), std::move(states_));
++      if (model_->UseBoundChunk()) {
++        std::tie(frames, states_) =
++            model_->RunBound(std::move(wav), voice_, std::move(states_),
++                             num_frames, &bound_);
++      } else {
++        OfflineSpeechDenoiserVoxLockModel::Voice voice;
++        voice.reserve(voice_.size());
++        for (auto &v : voice_) {
++          voice.push_back(View(&v));
++        }
++        std::tie(frames, states_) =
++            model_->Run(std::move(wav), std::move(voice), std::move(states_));
++      }
+ 
+       if (frames.GetTensorTypeAndShapeInfo().GetElementCount() !=
+           static_cast<size_t>(num_frames) * n_fft_) {
+@@ -393,6 +411,7 @@ class SpeechDenoiserVoxLockStream {
+ 
+   OfflineSpeechDenoiserVoxLockModel::Voice voice_;
+   OfflineSpeechDenoiserVoxLockModel::States states_;
++  OfflineSpeechDenoiserVoxLockModel::BoundChunk bound_;
+ 
+   std::vector<float> window_square_;
+ 

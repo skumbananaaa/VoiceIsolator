@@ -1,0 +1,73 @@
+name: Build reviewed Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Reviewed stable tag, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      REVIEWED_TAG: ${{ inputs.tag }}
+      RELEASE_PUBLIC_KEY: ${{ vars.MINISIGN_PUBLIC_KEY }}
+    steps:
+      - name: Check release inputs
+        shell: pwsh
+        run: |
+          if ($env:REVIEWED_TAG -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw 'Provide a stable vMAJOR.MINOR.PATCH tag.' }
+          if ($env:RELEASE_PUBLIC_KEY -cnotmatch '^RW[A-Za-z0-9+/]{54}$') { throw 'Set the MINISIGN_PUBLIC_KEY repository variable.' }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Check source version and install build tools
+        shell: pwsh
+        run: |
+          $version = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version\s*=\s*"([0-9.]+)"').Groups[1].Value
+          if ($env:REVIEWED_TAG -cne "v$version") { throw 'Tag and Cargo.toml version differ.' }
+          rustup toolchain install 1.99.1 --profile minimal
+          if ($LASTEXITCODE) { throw 'Rust toolchain installation failed.' }
+          rustup override set 1.99.1
+          if ($LASTEXITCODE) { throw 'Could not select the pinned Rust toolchain.' }
+          $inno = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.4.exe'
+          $directory = Join-Path $env:RUNNER_TEMP 'inno-6.7.4'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe' -OutFile $inno
+          if ((Get-FileHash -LiteralPath $inno).Hash -ine 'a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c') { throw 'Inno Setup hash mismatch.' }
+          $process = Start-Process -FilePath $inno -ArgumentList @('/PORTABLE=1','/VERYSILENT','/NORESTART',('/DIR="{0}"' -f $directory)) -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode) { throw "Inno Setup preparation failed ($($process.ExitCode))." }
+          "VI_ISCC=$directory\ISCC.exe" >> $env:GITHUB_ENV
+
+      - name: Build and test CPU installer
+        shell: pwsh
+        run: |
+          cmake -DVOICEISOLATOR_TEST_FIXTURES=ON -P scripts/fetch-deps.cmake
+          if ($LASTEXITCODE) { throw 'Could not verify release models and fixtures.' }
+          .\scripts\build-pcm-sdk.ps1 -Generator 'Visual Studio 17 2022' -Optimized
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -version '[17.0,18.0)' -property installationPath
+          if (!$vs) { throw 'Visual Studio 2022 with the x64 tools is required.' }
+          $runtime = Get-ChildItem -Path "$vs/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT" -Directory |
+            Sort-Object { [version]$_.Parent.Parent.Name } -Descending | Select-Object -First 1
+          if (!$runtime) { throw 'No x64 Visual C++ redistributable DLLs found.' }
+          .\scripts\build-installer.ps1 -NativeBuild sdk-vs2022 -Iscc $env:VI_ISCC `
+            -VCRuntimeDir $runtime.FullName -UpdatePublicKey $env:RELEASE_PUBLIC_KEY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoiceIsolator-${{ inputs.tag }}-review
+          path: |
+            out/windows-x64-pcm/Release/VoiceIsolator-Setup-x64.exe
+            out/windows-x64-pcm/Release/.installer-build.json
+          include-hidden-files: true
+          if-no-files-found: error

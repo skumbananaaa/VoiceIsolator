@@ -1,0 +1,8 @@
+/.deps/
+/out/
+/recordings/
+/reports/
+*.[Oo][Nn][Nn][Xx]
+*.[Ww][Aa][Vv]
+*.key
+*.sec
