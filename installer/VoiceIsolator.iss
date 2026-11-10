@@ -30,6 +30,14 @@ RestartApplications=no
 VersionInfoVersion={#AppVersion}.0
 LicenseFile={#Payload}\licenses\Microsoft-VC-Runtime-License.txt
 
+[Tasks]
+Name: "cuda"; Description: "Install NVIDIA CUDA support (about 1.6 GiB on first install)"; Flags: unchecked
+
+[InstallDelete]
+Type: files; Name: "{app}\cuda\installed-release"
+Type: filesandordirs; Name: "{app}\cuda"; Tasks: not cuda
+Type: files; Name: "{app}\models\chunk.onnx"; Tasks: not cuda
+
 [Files]
 Source: "{#Payload}\voiceisolator_live.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Payload}\voiceisolator_engine.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -43,6 +51,14 @@ Source: "{#Payload}\models\enroll.onnx"; DestDir: "{app}\models"; Flags: ignorev
 Source: "{#Payload}\models\chunk_int8.onnx"; DestDir: "{app}\models"; Flags: ignoreversion
 Source: "{#Payload}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs
 Source: "{#Payload}\installed-release"; DestDir: "{app}"; Flags: ignoreversion
+#include Payload + "\cuda-files.iss"
+Source: "{#Payload}\voiceisolator_engine.exe"; DestDir: "{app}\cuda"; Flags: ignoreversion; Tasks: cuda
+Source: "{#Payload}\sherpa-onnx-c-api.dll"; DestDir: "{app}\cuda"; Flags: ignoreversion; Tasks: cuda
+Source: "{#Payload}\vcruntime140.dll"; DestDir: "{app}\cuda"; Flags: ignoreversion; Tasks: cuda
+Source: "{#Payload}\vcruntime140_1.dll"; DestDir: "{app}\cuda"; Flags: ignoreversion; Tasks: cuda
+Source: "{#Payload}\msvcp140.dll"; DestDir: "{app}\cuda"; Flags: ignoreversion; Tasks: cuda
+Source: "{#Payload}\cuda-runtime-id"; DestDir: "{app}\cuda"; DestName: "runtime-id"; Flags: ignoreversion; Tasks: cuda
+Source: "{#Payload}\installed-release"; DestDir: "{app}\cuda"; Flags: ignoreversion; Tasks: cuda
 
 [Icons]
 Name: "{group}\VoiceIsolator"; Filename: "{app}\voiceisolator_live.exe"; WorkingDir: "{app}"
@@ -62,6 +78,8 @@ const
 
 var
   WizardStarted, InstallFinished: Boolean;
+
+#include "Cuda.iss"
 
 function OpenProcess(Access: Cardinal; Inherit: Boolean; ProcessId: Cardinal): THandle;
   external 'OpenProcess@kernel32.dll stdcall';
@@ -112,6 +130,7 @@ end;
 
 procedure InitializeWizard();
 begin
+  InitializeCudaWizard();
   WizardStarted := True;
 end;
 
@@ -166,8 +185,8 @@ end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  Result := '';
-  if not StopInstalledApp() then
+  Result := PrepareCuda();
+  if (Result = '') and not StopInstalledApp() then
     Result := 'Quit VoiceIsolator from the tray before installing.';
 end;
 

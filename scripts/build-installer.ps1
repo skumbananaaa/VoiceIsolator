@@ -33,7 +33,7 @@ Push-Location $root
 try {
     if ($ToolchainBin) { $env:Path = "$ToolchainBin;$env:Path" }
     $env:VOICEISOLATOR_UPDATE_PUBLIC_KEY = $UpdatePublicKey
-    & "$PSScriptRoot/build-rust.ps1" -OptimizedSdk -CpuOnly -Test -NoStage -Offline:$Offline
+    & "$PSScriptRoot/build-rust.ps1" -OptimizedSdk -Test -NoStage -Offline:$Offline
 
     New-Item -ItemType Directory -Path (Join-Path $payload 'models') -Force | Out-Null
     foreach ($file in @('voiceisolator_live.exe', 'voiceisolator_engine.exe')) {
@@ -57,6 +57,7 @@ try {
     & "$PSScriptRoot/collect-release-notices.ps1" -Destination (Join-Path $payload 'licenses') `
         -NativeBuild (Join-Path $root "out/windows-x64-pcm/$NativeBuild") `
         -InnoDirectory (Split-Path $Iscc -Parent) -Offline:$Offline
+    & "$PSScriptRoot/write-cuda-installer-includes.ps1" -Payload $payload -DependencyLock "$root/cmake/Dependencies.cmake"
 
     New-Item -ItemType Directory -Force -Path $output | Out-Null
     & $Iscc /Qp "/DAppVersion=$version" "/DPayload=$payload" "/O$output" "$root/installer/VoiceIsolator.iss"

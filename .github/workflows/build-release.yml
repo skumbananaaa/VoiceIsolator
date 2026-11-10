@@ -48,7 +48,7 @@ jobs:
           if ($process.ExitCode) { throw "Inno Setup preparation failed ($($process.ExitCode))." }
           "VI_ISCC=$directory\ISCC.exe" >> $env:GITHUB_ENV
 
-      - name: Build and test CPU installer
+      - name: Build and test installer
         shell: pwsh
         run: |
           cmake -DVOICEISOLATOR_TEST_FIXTURES=ON -P scripts/fetch-deps.cmake

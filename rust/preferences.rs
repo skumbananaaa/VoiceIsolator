@@ -228,7 +228,7 @@ fn enabled() -> bool {
 }
 
 impl Settings {
-    pub fn load() -> Result<Self> {
+    pub fn load(cuda_available: bool) -> Result<Self> {
         let path = profile_path()?.with_file_name("settings.json");
         let file = match fs::File::open(path) {
             Ok(file) => file,
@@ -236,7 +236,7 @@ impl Settings {
             Err(err) => return Err(err.into()),
         };
         let mut settings: Self = serde_json::from_reader(file.take(16_385))?;
-        if cfg!(feature = "cpu-only") && settings.processing.backend != Backend::Cpu {
+        if !cuda_available && settings.processing.backend == Backend::Cuda {
             settings.processing.backend = Backend::Cpu;
             settings.resume = false;
         }

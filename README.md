@@ -2,7 +2,7 @@
 
 VoiceIsolator is a native Windows x64 Rust application for isolating an enrolled speaker from a live microphone and routing the result to a virtual cable. The egui desktop supervises a separate Rust audio process. Enrollment and inference run locally through the pinned native sherpa-onnx C API and VoxLock weights.
 
-The Windows installer uses the CPU backend and includes the INT8 models. Install [VB-CABLE](https://vb-audio.com/Cable/) separately, then select your microphone and cable in VoiceIsolator and record your voice. Closing the window parks the app in the tray. Choose **Quit** in the tray to close the app or **Stop isolation** to stay in standby on the next launch. The installed app offers **Start with Windows** under Settings.
+The Windows installer includes the CPU backend and INT8 models. On a PC with a compatible NVIDIA GPU and driver, select **Install NVIDIA CUDA support** in Setup and accept NVIDIA’s license agreements. Setup downloads about 1.6 GiB on first install and keeps the runtime inside VoiceIsolator. This option is also available when Setup opens from **Install update**. After installation, choose **CUDA** under **Backend** in the app. Install [VB-CABLE](https://vb-audio.com/Cable/) separately, then select your microphone and cable in VoiceIsolator and record your voice. Closing the window parks the app in the tray. Choose **Quit** in the tray to close the app or **Stop isolation** to stay in standby on the next launch. The installed app offers **Start with Windows** under Settings.
 
 See [release instructions](docs/release.md) for building and signing the installer.
 
@@ -24,7 +24,7 @@ Open **voiceisolator_live.exe** in `out/windows-x64-pcm/Release`. Keep it beside
 
 Drag the dials up or down, scroll over them, or focus a dial and use the arrow keys. **Home** resets the focused dial. When you edit a setting during isolation, the isolation button becomes **Apply changes**. Gain-only changes apply to the live stream. Changing the virtual cable, **Backend**, **Batch size** (16–40 ms), **CPU threads** (1–4), or **Clock correction** restarts the stream. **Settings → Reset processing settings** restores CPU inference, 0 dB gain, 16 ms batches, one thread, and Linear clock correction. During isolation the reset is staged until you apply it. Stop isolation to change the microphone or voice profile.
 
-**Backend** selects sherpa-onnx's CPU or NVIDIA CUDA execution provider. The live CPU option uses the INT8 model and CUDA uses the FP32 model. The optimized SDK keeps speaker conditioning and recurrent state on the GPU when the CUDA session supports it. CUDA needs the optional runtime below and warms up before opening the audio route, so a cold start can take longer. If CUDA cannot initialize, the app reports the error and leaves the route closed. ONNX Runtime may still run individual operations on the CPU when the CUDA provider is active.
+**Backend** selects sherpa-onnx's CPU or NVIDIA CUDA execution provider when CUDA support is installed. The live CPU option uses the INT8 model and CUDA uses the FP32 model. The optimized SDK keeps speaker conditioning and recurrent state on the GPU when the CUDA session supports it. CUDA warms up before opening the audio route, so a cold start can take longer. If CUDA cannot initialize, the app reports the error and leaves the route closed. Select CPU to continue. ONNX Runtime may still run individual operations on the CPU when the CUDA provider is active.
 
 Use **Settings → Dark mode** to switch themes. VoiceIsolator restores your last choice and defaults to dark on a fresh profile.
 
@@ -51,7 +51,7 @@ cmake -P scripts/fetch-deps.cmake
 
 For Visual Studio 2022, pass `-Generator 'Visual Studio 17 2022'` to the SDK script. The Rust script always installs both executables and the matching DLLs in `out/windows-x64-pcm/Release`. Use `-CloseRunningApp` to close the current VoiceIsolator window before replacing it. Use `-Offline` once Cargo's dependencies are cached.
 
-### Enable CUDA
+### Enable CUDA in a development build
 
 Use an NVIDIA GPU and a compatible driver. Make the CUDA 12.x and cuDNN 9.x runtime DLLs available beside the executable or on the Windows `PATH` when you launch VoiceIsolator. The CUDA build uses the same sherpa SDK with Microsoft's matching ONNX Runtime 1.28.2 CUDA 12 package. [ONNX Runtime CUDA requirements](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html)
 

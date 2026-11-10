@@ -191,12 +191,40 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn cuda_available(desktop: &std::path::Path) -> bool {
+        if cfg!(feature = "cpu-only") {
+            return false;
+        }
+        if !desktop.with_file_name("installed-release").is_file() {
+            return true;
+        }
+        let cuda = desktop.with_file_name("cuda");
+        std::fs::read_to_string(cuda.join("installed-release"))
+            .is_ok_and(|version| version.trim() == env!("CARGO_PKG_VERSION"))
+            && cuda.join("voiceisolator_engine.exe").is_file()
+            && desktop
+                .with_file_name("models")
+                .join("chunk.onnx")
+                .is_file()
+    }
+
     pub fn launch(config: Config) -> Result<Self> {
         let job = Job::new()?;
         let desktop = std::env::current_exe()?;
-        let worker = desktop.with_file_name("voiceisolator_engine.exe");
+        let installed = desktop.with_file_name("installed-release").is_file();
+        let worker = if config.processing.backend == Backend::Cuda && installed {
+            ensure!(
+                Self::cuda_available(&desktop),
+                "Install NVIDIA CUDA support in VoiceIsolator Setup or select CPU"
+            );
+            desktop
+                .with_file_name("cuda")
+                .join("voiceisolator_engine.exe")
+        } else {
+            desktop.with_file_name("voiceisolator_engine.exe")
+        };
         let mut command = Command::new(&worker);
-        if !worker.is_file() && !desktop.with_file_name("installed-release").is_file() {
+        if !worker.is_file() && !installed {
             // Cargo can build just the desktop target during development.
             command = Command::new(desktop);
             command.arg("--engine");
@@ -827,6 +855,30 @@ fn generation(config: &Config, shared: &Shared, model: &mut VoxLock, tap: &Tap) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "cpu-only"))]
+    #[test]
+    fn installed_cuda_requires_a_matching_worker_and_model() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let desktop = root.join("voiceisolator_live.exe");
+        std::fs::write(root.join("installed-release"), env!("CARGO_PKG_VERSION"))?;
+        assert!(!Session::cuda_available(&desktop));
+
+        let cuda = root.join("cuda");
+        std::fs::create_dir(&cuda)?;
+        std::fs::create_dir(root.join("models"))?;
+        std::fs::write(cuda.join("voiceisolator_engine.exe"), [])?;
+        std::fs::write(root.join("models/chunk.onnx"), [])?;
+        std::fs::write(cuda.join("installed-release"), "0.0.0")?;
+        assert!(!Session::cuda_available(&desktop));
+
+        std::fs::write(cuda.join("installed-release"), env!("CARGO_PKG_VERSION"))?;
+        assert!(Session::cuda_available(&desktop));
+        std::fs::remove_file(root.join("models/chunk.onnx"))?;
+        assert!(!Session::cuda_available(&desktop));
+        Ok(())
+    }
 
     #[test]
     fn deadline_includes_queueing_and_output_publication() {

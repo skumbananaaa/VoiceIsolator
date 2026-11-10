@@ -41,9 +41,9 @@ fn main() -> Result<()> {
     let Some(instance) = Instance::acquire(!startup)? else {
         return Ok(());
     };
-    let installed = std::env::current_exe()?
-        .with_file_name("installed-release")
-        .is_file();
+    let exe = std::env::current_exe()?;
+    let installed = exe.with_file_name("installed-release").is_file();
+    let cuda_available = Session::cuda_available(&exe);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([784.0, 754.0])
@@ -66,6 +66,7 @@ fn main() -> Result<()> {
                 &cc.egui_ctx,
                 instance,
                 installed,
+                cuda_available,
                 startup,
                 after_update,
             )?))
@@ -135,6 +136,7 @@ struct Desktop {
     instance: Instance,
     tray: Tray,
     installed: bool,
+    cuda_available: bool,
     hidden: bool,
     quitting: bool,
     settings: Settings,
@@ -173,10 +175,11 @@ impl Desktop {
         ctx: &egui::Context,
         instance: Instance,
         installed: bool,
+        cuda_available: bool,
         hidden: bool,
         after_update: bool,
     ) -> Result<Self> {
-        let (mut settings, settings_error) = match Settings::load() {
+        let (mut settings, settings_error) = match Settings::load(cuda_available) {
             Ok(settings) => (settings, None),
             Err(error) => (
                 Settings::default(),
@@ -211,6 +214,7 @@ impl Desktop {
             instance,
             tray: Tray::new(ctx, installed)?,
             installed,
+            cuda_available,
             hidden,
             quitting: false,
             startup: preferences::startup_enabled(),
@@ -812,7 +816,7 @@ impl Desktop {
                         }
                     });
                 ui.weak("Clock correction");
-                if !cfg!(feature = "cpu-only") {
+                if self.cuda_available {
                     egui::ComboBox::from_id_salt("backend")
                     .width(72.0)
                     .selected_text(self.processing.backend.label())
