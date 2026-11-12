@@ -1,7 +1,6 @@
 use crate::{
     PROFILE_SAMPLES,
     engine::{Gains, Processing},
-    isolation::Backend,
     wasapi::Devices,
 };
 use anyhow::{Context, Result, ensure};
@@ -30,6 +29,7 @@ use windows::{
 const SETTINGS: PCWSTR = w!("Software\\VoiceIsolator");
 const STARTUP: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const STARTUP_NAME: PCWSTR = w!("VoiceIsolator");
+const MAX_STARTUP_COMMAND: usize = 260;
 const MAX_ID: usize = 1023;
 
 pub struct Profile {
@@ -228,18 +228,14 @@ fn enabled() -> bool {
 }
 
 impl Settings {
-    pub fn load(cuda_available: bool) -> Result<Self> {
+    pub fn load() -> Result<Self> {
         let path = profile_path()?.with_file_name("settings.json");
         let file = match fs::File::open(path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(err) => return Err(err.into()),
         };
-        let mut settings: Self = serde_json::from_reader(file.take(16_385))?;
-        if !cuda_available && settings.processing.backend == Backend::Cuda {
-            settings.processing.backend = Backend::Cpu;
-            settings.resume = false;
-        }
+        let settings: Self = serde_json::from_reader(file.take(16_385))?;
         ensure!(
             settings.processing.valid() && settings.gains.valid(),
             "Invalid saved processing settings"
@@ -274,18 +270,38 @@ impl Default for Settings {
 }
 
 pub fn startup_enabled() -> bool {
-    unsafe {
+    let Ok(expected) = startup_command() else {
+        return false;
+    };
+    let mut command = [0_u16; MAX_STARTUP_COMMAND];
+    let mut bytes = size_of_val(&command) as u32;
+    let status = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
             STARTUP,
             STARTUP_NAME,
             RRF_RT_REG_SZ,
             None,
-            None,
-            None,
+            Some(command.as_mut_ptr().cast()),
+            Some(&mut bytes),
         )
-        .is_ok()
-    }
+    };
+    status.is_ok()
+        && (bytes as usize == size_of_val(expected.as_slice()))
+        && String::from_utf16_lossy(&command[..expected.len()])
+            .eq_ignore_ascii_case(&String::from_utf16_lossy(&expected))
+}
+
+fn startup_command() -> Result<Vec<u16>> {
+    let exe = std::env::current_exe()?;
+    let mut command = vec![b'"' as u16];
+    command.extend(exe.as_os_str().encode_wide());
+    command.extend("\" --startup\0".encode_utf16());
+    ensure!(
+        command.len() <= MAX_STARTUP_COMMAND,
+        "The installed path is too long for Windows startup"
+    );
+    Ok(command)
 }
 
 pub fn set_startup(enabled: bool) -> Result<()> {
@@ -296,14 +312,7 @@ pub fn set_startup(enabled: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let exe = std::env::current_exe()?;
-    let mut command = vec![b'"' as u16];
-    command.extend(exe.as_os_str().encode_wide());
-    command.extend("\" --startup\0".encode_utf16());
-    ensure!(
-        command.len() <= 260,
-        "The installed path is too long for Windows startup"
-    );
+    let command = startup_command()?;
     unsafe {
         RegSetKeyValueW(
             HKEY_CURRENT_USER,

@@ -179,7 +179,7 @@ impl Desktop {
         hidden: bool,
         after_update: bool,
     ) -> Result<Self> {
-        let (mut settings, settings_error) = match Settings::load(cuda_available) {
+        let (settings, settings_error) = match Settings::load() {
             Ok(settings) => (settings, None),
             Err(error) => (
                 Settings::default(),
@@ -196,17 +196,13 @@ impl Desktop {
             Err(error) => (None, Some((true, error.clone()))),
         };
         let mut resume_until = None;
-        let mut settings_dirty = false;
-        if settings.resume {
-            if !after_update {
-                if enrolled.as_ref() == Some(&preferred.microphone) && !preferred.cable.is_empty() {
-                    resume_until = Some(Instant::now() + Duration::from_secs(30));
-                } else if notice.is_none() {
-                    notice = Some((true, "Could not resume isolation. The saved microphone, cable or voice profile is missing.".to_owned()));
-                }
+        let backend_available = settings.processing.backend != Backend::Cuda || cuda_available;
+        if settings.resume && !after_update && backend_available {
+            if enrolled.as_ref() == Some(&preferred.microphone) && !preferred.cable.is_empty() {
+                resume_until = Some(Instant::now() + Duration::from_secs(30));
+            } else if notice.is_none() {
+                notice = Some((true, "Could not resume isolation. The saved microphone, cable or voice profile is missing.".to_owned()));
             }
-            settings.resume = false;
-            settings_dirty = true;
         }
         let dark = settings.dark;
         theme(ctx, dark);
@@ -245,10 +241,9 @@ impl Desktop {
             output_meter: 0.0,
             meter_time: Instant::now(),
             settings,
-            settings_dirty,
+            settings_dirty: false,
         };
         app.refresh(ctx);
-        app.save_settings();
         if installed {
             thread::spawn(updates::cleanup);
         }
@@ -297,13 +292,15 @@ impl Desktop {
     }
 
     fn save_standby_edits(&mut self) {
-        if self.session.is_some() || self.resume_until.is_some() || self.quitting {
+        if self.session.is_some() || self.quitting {
             return;
         }
         if self.settings.choices != self.preferred
             || self.settings.processing != self.processing
             || self.settings.gains != self.gains
         {
+            self.resume_until = None;
+            self.settings.resume = false;
             self.settings.choices = self.preferred.clone();
             self.settings.processing = self.processing.clone();
             self.settings.gains = self.gains;
@@ -315,6 +312,7 @@ impl Desktop {
     fn can_start(&self) -> bool {
         self.recording.is_none()
             && !self.downloading()
+            && (self.processing.backend != Backend::Cuda || self.cuda_available)
             && self.selected_profile()
             && self.devices.as_ref().is_some_and(|devices| {
                 devices
@@ -484,9 +482,6 @@ impl Desktop {
             }
             Err(error) => {
                 self.restore_approved();
-                self.settings.resume = false;
-                self.settings_dirty = true;
-                self.save_settings();
                 self.notice = Some((true, format!("Could not start isolation. {error:#}")));
             }
         }
@@ -536,7 +531,11 @@ impl Desktop {
         if self.selected_profile() {
             preferences::delete_profile(&path)?;
             self.enrolled = None;
+            self.resume_until = None;
+            self.settings.resume = false;
+            self.settings_dirty = true;
             self.notice = Some((false, "Voice profile removed.".to_owned()));
+            self.save_settings();
         } else {
             self.recording = Some(Recording::start(self.choices.microphone.clone(), path)?);
             self.notice = None;
@@ -590,8 +589,13 @@ impl Desktop {
                 self.recording = None;
                 match result {
                     Ok(id) => {
+                        self.preferred.microphone.clone_from(&id);
+                        self.settings.choices.microphone.clone_from(&id);
                         self.enrolled = Some(id);
+                        self.settings.resume = false;
+                        self.settings_dirty = true;
                         self.notice = Some((false, "Voice profile saved on this PC.".to_owned()));
+                        self.save_settings();
                     }
                     Err(_) if canceled => {
                         self.notice = Some((false, "Recording canceled.".to_owned()))
@@ -642,10 +646,8 @@ impl Desktop {
                     self.pending_save = false;
                     self.clear_latency();
                     self.restore_approved();
-                    self.settings.resume = false;
-                    self.settings_dirty = true;
-                    self.save_settings();
-                    self.notice = Some((true, format!("{error:#}")));
+                    self.notice = Some((true, format!("Isolation stopped. {error:#}")));
+                    self.refresh(ctx);
                 }
             }
         }
@@ -680,7 +682,10 @@ impl Desktop {
         ui.horizontal(|ui| {
             ui.menu_button("Session", |ui| {
                 if ui
-                    .add_enabled(self.session.is_some(), egui::Button::new("Stop isolation"))
+                    .add_enabled(
+                        self.session.is_some() || self.settings.resume,
+                        egui::Button::new("Stop isolation"),
+                    )
                     .clicked()
                 {
                     self.stop();
@@ -705,7 +710,10 @@ impl Desktop {
                 }
                 if self.installed {
                     let mut enabled = self.startup;
-                    if ui.checkbox(&mut enabled, "Start with Windows").changed() {
+                    if ui.checkbox(&mut enabled, "Start with Windows")
+                        .on_hover_text("Opens VoiceIsolator in the tray when you sign in. Check Windows Settings → Apps → Startup if Windows has disabled it.")
+                        .changed()
+                    {
                         let result = preferences::set_startup(enabled);
                         if result.is_ok() {
                             self.startup = enabled;
@@ -781,6 +789,23 @@ impl Desktop {
                 self.resume_until = None;
                 self.preferred.cable.clone_from(&self.choices.cable);
             }
+            if let Some(enrolled) = &self.enrolled
+                && !self.selected_profile()
+                && let Some(devices) = &self.devices
+            {
+                if let Some(mic) = devices
+                    .microphones
+                    .iter()
+                    .find(|device| device.id == *enrolled)
+                {
+                    ui.weak(format!(
+                        "Voice profile saved for {}. Select that microphone to use it.",
+                        mic.name
+                    ));
+                } else {
+                    ui.weak("Voice profile saved. Reconnect the microphone used to record it and refresh devices.");
+                }
+            }
             if self
                 .devices
                 .as_ref()
@@ -816,19 +841,32 @@ impl Desktop {
                         }
                     });
                 ui.weak("Clock correction");
-                if self.cuda_available {
+                if self.cuda_available || self.processing.backend == Backend::Cuda {
                     egui::ComboBox::from_id_salt("backend")
-                    .width(72.0)
-                    .selected_text(self.processing.backend.label())
-                    .show_ui(ui, |ui| {
-                        for backend in [Backend::Cpu, Backend::Cuda] {
-                            ui.selectable_value(&mut self.processing.backend, backend, backend.label());
-                        }
-                    }).response.on_hover_text("CUDA requires the optional NVIDIA runtime. Applying a backend change restarts isolation.");
+                        .width(108.0)
+                        .selected_text(self.processing.backend.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.processing.backend, Backend::Cpu, "CPU");
+                            if self.cuda_available {
+                                ui.selectable_value(
+                                    &mut self.processing.backend,
+                                    Backend::Cuda,
+                                    "CUDA",
+                                );
+                            }
+                        })
+                        .response
+                        .on_hover_text("Applying a backend change restarts isolation.");
                     ui.weak("Backend");
                 }
             });
         });
+        if self.processing.backend == Backend::Cuda && !self.cuda_available {
+            ui.colored_label(ui.visuals().warn_fg_color, format!(
+                "The saved {} backend is unavailable. Restore its support or select CPU to start isolation.",
+                self.processing.backend.label(),
+            ));
+        }
         let mut batch = BATCHES
             .iter()
             .position(|&batch| batch == self.processing.batch_ms)
@@ -873,6 +911,8 @@ impl Desktop {
             }
         } else if self.selected_profile() {
             "Forget voice"
+        } else if self.enrolled.is_some() {
+            "Replace voice profile"
         } else {
             "Record voice"
         };
@@ -890,6 +930,7 @@ impl Desktop {
             "Stop isolation"
         };
         let record_enabled = self.session.is_none()
+            && self.resume_until.is_none()
             && !self.downloading()
             && !self.choices.microphone.is_empty()
             && !self.recording.as_ref().is_some_and(|r| r.canceled);
@@ -981,6 +1022,11 @@ impl Desktop {
                         ""
                     }
                 ));
+                if result.packet_ages.available() {
+                    ui.weak(result.packet_ages.to_string()).on_hover_text(
+                        "Time from the newest audio frame’s Windows timestamp until Voice Isolator reads the packet.",
+                    );
+                }
             } else {
                 ui.weak("Measure on demand while isolation is live.");
             }
@@ -1156,6 +1202,12 @@ impl eframe::App for Desktop {
                     if status.model_ready
                         && let Some(session) = &self.session
                     {
+                        if status.batch_ms > session.config.processing.batch_ms {
+                            ui.weak(format!(
+                                "Repeated CPU overruns increased the batch size to {} ms for this session.",
+                                status.batch_ms
+                            ));
+                        }
                         ui.weak(format!(
                             "{}  ·  Queue peak {:.1} ms  ·  underruns {}  ·  restarts {}",
                             session.config.processing.backend.label(),
@@ -1189,7 +1241,7 @@ impl eframe::App for Desktop {
                         ui.colored_label(color, notice);
                     } else if self.resume_until.is_some() {
                         ui.weak("Waiting for the saved microphone and virtual cable…");
-                    } else if !self.selected_profile()
+                    } else if self.enrolled.is_none()
                         && self.recording.is_none()
                         && self.session.is_none()
                     {

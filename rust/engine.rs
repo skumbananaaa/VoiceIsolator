@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     io::{self, BufRead, BufReader, BufWriter, Read, Write},
     os::windows::{io::AsRawHandle, process::CommandExt},
     path::PathBuf,
@@ -35,6 +36,7 @@ use windows::{
 
 pub const BATCHES: [usize; 4] = [16, 24, 32, 40];
 const CONTROL_LIMIT: u64 = 16_384;
+const RECOVERY_WINDOW: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Processing {
@@ -58,9 +60,7 @@ impl Default for Processing {
 
 impl Processing {
     pub fn valid(&self) -> bool {
-        BATCHES.contains(&self.batch_ms)
-            && (1..=4).contains(&self.threads)
-            && (!cfg!(feature = "cpu-only") || self.backend == Backend::Cpu)
+        BATCHES.contains(&self.batch_ms) && (1..=4).contains(&self.threads)
     }
 }
 
@@ -98,6 +98,8 @@ enum Control {
 pub struct Status {
     pub model_ready: bool,
     pub live: bool,
+    #[serde(default)]
+    pub batch_ms: usize,
     pub input: f32,
     pub output: f32,
     pub underruns: usize,
@@ -150,6 +152,7 @@ struct Inbox {
     status: Status,
     measured: Option<Result<Latency, String>>,
     fault: Option<String>,
+    closed: bool,
 }
 
 struct Job(HANDLE);
@@ -263,7 +266,10 @@ impl Session {
                     Ok(Some(Update::Status(status))) => inbox.status = status,
                     Ok(Some(Update::Measured(result))) => inbox.measured = Some(result),
                     Ok(Some(Update::Fault(error))) => inbox.fault = Some(error),
-                    Ok(None) => break,
+                    Ok(None) => {
+                        inbox.closed = true;
+                        break;
+                    }
                     Err(error) => {
                         inbox.fault = Some(format!("Audio engine status failed: {error:#}"));
                         break;
@@ -343,7 +349,11 @@ impl Session {
         if let Some(error) = &inbox.fault {
             bail!("{error}");
         }
-        if let Some(code) = exited {
+        // Drain the status pipe before reporting the exit code. The final
+        // message can contain the audio error that caused the worker to exit.
+        if inbox.closed
+            && let Some(code) = exited
+        {
             bail!("The audio engine exited ({code}).");
         }
         if inbox.status.heartbeat != self.last_heartbeat {
@@ -378,6 +388,7 @@ impl Drop for Session {
 struct Meters {
     model_ready: AtomicBool,
     live: AtomicBool,
+    batch_ms: AtomicUsize,
     input: AtomicU32,
     output: AtomicU32,
     underruns: AtomicUsize,
@@ -450,6 +461,7 @@ impl Meters {
         Status {
             model_ready: self.model_ready.load(Acquire),
             live: self.live.load(Relaxed),
+            batch_ms: self.batch_ms.load(Relaxed),
             input: f32::from_bits(self.input.swap(0, Relaxed)),
             output: f32::from_bits(self.output.swap(0, Relaxed)),
             underruns: self.underruns.load(Relaxed),
@@ -511,6 +523,7 @@ fn child_session(
 ) -> Result<()> {
     ensure!(
         config.processing.valid()
+            && (!cfg!(feature = "cpu-only") || config.processing.backend == Backend::Cpu)
             && config.gains.valid()
             && !config.microphone.is_empty()
             && !config.cable.is_empty(),
@@ -615,6 +628,76 @@ fn child_session(
     })
 }
 
+#[derive(Debug)]
+struct CaptureOverrun;
+
+impl fmt::Display for CaptureOverrun {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Isolation fell behind the microphone.")
+    }
+}
+
+impl std::error::Error for CaptureOverrun {}
+
+#[derive(Default)]
+struct RouteRecovery {
+    failures: u32,
+    retry_since: Option<Instant>,
+    recent_overruns: [Option<Instant>; 2],
+}
+
+impl RouteRecovery {
+    fn larger_cpu_batch(
+        &mut self,
+        backend: Backend,
+        batch_ms: usize,
+        max_batch_ms: usize,
+        now: Instant,
+        error: &anyhow::Error,
+    ) -> Option<usize> {
+        if backend != Backend::Cpu || !error.is::<CaptureOverrun>() {
+            return None;
+        }
+        let next = BATCHES
+            .into_iter()
+            .find(|&size| size > batch_ms && size <= max_batch_ms)?;
+        let [oldest, newest] = self.recent_overruns;
+        self.recent_overruns = [newest, Some(now)];
+        if oldest.is_some_and(|oldest| now.duration_since(oldest) <= RECOVERY_WINDOW) {
+            *self = Self::default();
+            return Some(next);
+        }
+        None
+    }
+
+    fn retry_delay(&mut self, started: Instant, now: Instant, error: anyhow::Error) -> Result<u32> {
+        if now.duration_since(started) >= Duration::from_secs(5) {
+            self.failures = 0;
+            self.retry_since = None;
+        }
+        let timeout = if error.is::<CaptureOverrun>() {
+            Some("Isolation could not catch up with the microphone within 30 seconds.")
+        } else if wasapi::device_unavailable(&error) {
+            Some("The selected audio device did not return within 30 seconds.")
+        } else {
+            None
+        };
+        if let Some(timeout) = timeout {
+            let since = *self.retry_since.get_or_insert(now);
+            let remaining = RECOVERY_WINDOW.saturating_sub(now.duration_since(since));
+            if remaining.is_zero() {
+                return Err(error).context(timeout);
+            }
+            return Ok(remaining.as_millis().clamp(1, 500) as u32);
+        }
+        self.failures += 1;
+        if self.failures > 3 {
+            return Err(error).context("The audio route failed after three recovery attempts.");
+        }
+        Ok(250 * self.failures)
+    }
+}
+
 fn run_audio(config: &Config, shared: &Shared, tap: &Tap) -> Result<()> {
     let profile = preferences::load_profile(&preferences::profile_path()?)?
         .context("Record your voice before starting isolation.")?;
@@ -622,43 +705,54 @@ fn run_audio(config: &Config, shared: &Shared, tap: &Tap) -> Result<()> {
         profile.microphone == config.microphone,
         "Record your voice again for the selected microphone."
     );
-    let backend = config.processing.backend;
+    let processing = &config.processing;
     let mut model = VoxLock::open(
         &config.models,
-        backend.live_precision(),
+        processing.backend.live_precision(),
         &profile.samples,
-        config.processing.threads,
-        backend,
+        processing.threads,
+        processing.backend,
     )
-    .with_context(|| format!("Could not start the {} backend", backend.label()))?;
+    .with_context(|| format!("Could not start the {} backend", processing.backend.label()))?;
     drop(profile);
-    if backend == Backend::Cuda {
+    if processing.backend == Backend::Cuda {
         // Initialize GPU kernels before starting the microphone and cable.
         model
-            .warm_up(config.processing.batch_ms * RATE / 1000)
+            .warm_up(processing.batch_ms * RATE / 1000)
             .context("Could not warm up the CUDA backend")?;
     }
+    let mut batch_ms = processing.batch_ms;
+    let max_batch_ms = AtomicUsize::new(batch_ms);
     shared.meters.heartbeat.fetch_add(1, Relaxed);
     shared.meters.model_ready.store(true, Release);
-    let mut consecutive = 0;
+    let mut recovery = RouteRecovery::default();
     while !shared.stopped.load(Relaxed) {
         let start = Instant::now();
-        let result = generation(config, shared, &mut model, tap);
+        shared.meters.batch_ms.store(batch_ms, Relaxed);
+        let result = generation(config, shared, &mut model, tap, batch_ms, &max_batch_ms);
         shared.meters.live.store(false, Relaxed);
         if shared.stopped.load(Relaxed) {
             return Ok(());
         }
         let error = result.err().context("Audio route stopped unexpectedly")?;
-        if start.elapsed() >= Duration::from_secs(5) {
-            consecutive = 0;
-        }
-        consecutive += 1;
-        if consecutive > 3 {
-            return Err(error).context("The selected devices did not recover.");
-        }
+        let now = Instant::now();
+        let limit = max_batch_ms.load(Relaxed);
+        let retry_ms = if (processing.batch_ms..batch_ms).contains(&limit) {
+            // Reopening a device can change its audio period.
+            batch_ms = limit;
+            recovery = RouteRecovery::default();
+            0
+        } else if let Some(larger) =
+            recovery.larger_cpu_batch(processing.backend, batch_ms, limit, now, &error)
+        {
+            batch_ms = larger;
+            0
+        } else {
+            recovery.retry_delay(start, now, error)?
+        };
         shared.meters.recoveries.fetch_add(1, Relaxed);
         shared.meters.heartbeat.fetch_add(1, Relaxed);
-        let _ = wasapi::wait([&shared.stop], 250 * consecutive as u32)?;
+        let _ = wasapi::wait([&shared.stop], retry_ms)?;
         if !shared.stopped.load(Relaxed) {
             let reset = Instant::now();
             model.reset()?;
@@ -671,9 +765,16 @@ fn run_audio(config: &Config, shared: &Shared, tap: &Tap) -> Result<()> {
     Ok(())
 }
 
-fn generation(config: &Config, shared: &Shared, model: &mut VoxLock, tap: &Tap) -> Result<()> {
-    let batch = config.processing.batch_ms * RATE / 1000;
-    let budget = Duration::from_millis(config.processing.batch_ms as u64);
+fn generation(
+    config: &Config,
+    shared: &Shared,
+    model: &mut VoxLock,
+    tap: &Tap,
+    batch_ms: usize,
+    max_batch_ms: &AtomicUsize,
+) -> Result<()> {
+    let batch = batch_ms * RATE / 1000;
+    let budget = Duration::from_millis(batch_ms as u64);
     let playback = Playback::new(config.processing.correction);
     let (mut input_tx, mut input_rx) = playback::ring();
     // The extra slot allows the worker to pop PCM before consuming its timestamp.
@@ -694,11 +795,27 @@ fn generation(config: &Config, shared: &Shared, model: &mut VoxLock, tap: &Tap) 
             let result = (|| -> Result<()> {
                 let _com = Com::init()?;
                 let devices = wasapi::enumerator()?;
-                let mut capture = Stream::open(&devices, &config.microphone, eCapture, false)?;
-                let mut render = Stream::open(&devices, &config.cable, eRender, true)?;
+                let mut capture = Stream::open(&devices, &config.microphone, eCapture, false)
+                    .context("Open the selected microphone")?;
+                let mut render = Stream::open(&devices, &config.cable, eRender, true)
+                    .context("Open the selected virtual cable")?;
+                let capture_period = capture.period()?;
                 let render_period = render.period()?;
+                if config.processing.backend == Backend::Cpu {
+                    let max_batch = BATCHES.into_iter().rev().find(|&size| {
+                        playback
+                            .configure(
+                                size * RATE / 1000,
+                                capture_period,
+                                render_period,
+                                render.capacity,
+                            )
+                            .is_some()
+                    });
+                    max_batch_ms.store(max_batch.unwrap_or(0), Relaxed);
+                }
                 let padding = playback
-                    .configure(batch, capture.period()?, render_period, render.capacity)
+                    .configure(batch, capture_period, render_period, render.capacity)
                     .context("The Windows audio periods are too large for live isolation.")?;
                 render_period_ms.store((render_period * 1000).div_ceil(RATE) as u32, Relaxed);
                 render.render(padding, |_| false)?;
@@ -716,51 +833,63 @@ fn generation(config: &Config, shared: &Shared, model: &mut VoxLock, tap: &Tap) 
                     )? {
                         Some(0 | 1) => return Ok(()),
                         Some(2) => {
-                            if capture.capture(|packet| {
-                                ensure!(!packet.gap, "Microphone stream was interrupted.");
-                                let frames = partial_batch + packet.frames;
-                                if frames >= batch {
-                                    let arrived = Instant::now();
-                                    // Publish timestamps before the PCM they describe.
-                                    for _ in 0..frames / batch {
-                                        arrival_tx
-                                            .try_send(arrived)
-                                            .context("Isolation fell behind the microphone.")?;
+                            let captured = capture
+                                .capture(|packet| {
+                                    ensure!(!packet.gap, "Microphone stream was interrupted.");
+                                    tap.push(&packet);
+                                    let frames = partial_batch + packet.frames;
+                                    let complete = frames / batch;
+                                    if complete != 0 {
+                                        let arrived = Instant::now();
+                                        // Publish timestamps before the PCM they describe.
+                                        for _ in 0..complete {
+                                            arrival_tx
+                                                .try_send(arrived)
+                                                .map_err(|_| CaptureOverrun)?;
+                                        }
                                     }
-                                }
-                                partial_batch = frames % batch;
-                                ensure!(
-                                    input_tx.push(packet.samples, packet.frames),
-                                    "Isolation fell behind the microphone."
-                                );
-                                tap.push(&packet);
-                                Ok(())
-                            })? {
+                                    partial_batch = frames % batch;
+                                    ensure!(
+                                        input_tx.push(packet.samples, packet.frames),
+                                        CaptureOverrun
+                                    );
+                                    // A capture event can contain several packets. Wake inference
+                                    // as soon as it has a batch so it can drain the queue in parallel.
+                                    if complete != 0 {
+                                        ready.signal();
+                                    }
+                                    Ok(())
+                                })
+                                .context("Read from the selected microphone")?;
+                            if captured {
                                 last[0] = Instant::now();
-                                ready.signal();
                             }
                         }
                         Some(3) => {
-                            render.render(padding, |frames| {
-                                if !matches!(wasapi::wait([&shared.stop, &terminate], 0), Ok(None))
-                                {
-                                    return false;
-                                }
-                                let fill = playback.fill(&mut output_rx, frames);
-                                shared
-                                    .meters
-                                    .output_pending_frames
-                                    .store(fill.pending, Relaxed);
-                                shared.meters.peak_frames.fetch_max(fill.pending, Relaxed);
-                                shared.meters.live.store(fill.primed, Relaxed);
-                                if fill.underrun {
-                                    shared.meters.underruns.fetch_add(1, Relaxed);
-                                }
-                                if fill.produced > 0 {
-                                    writable.signal();
-                                }
-                                fill.produced > 0
-                            })?;
+                            render
+                                .render(padding, |frames| {
+                                    if !matches!(
+                                        wasapi::wait([&shared.stop, &terminate], 0),
+                                        Ok(None)
+                                    ) {
+                                        return false;
+                                    }
+                                    let fill = playback.fill(&mut output_rx, frames);
+                                    shared
+                                        .meters
+                                        .output_pending_frames
+                                        .store(fill.pending, Relaxed);
+                                    shared.meters.peak_frames.fetch_max(fill.pending, Relaxed);
+                                    shared.meters.live.store(fill.primed, Relaxed);
+                                    if fill.underrun {
+                                        shared.meters.underruns.fetch_add(1, Relaxed);
+                                    }
+                                    if fill.produced > 0 {
+                                        writable.signal();
+                                    }
+                                    fill.produced > 0
+                                })
+                                .context("Write to the selected virtual cable")?;
                             last[1] = Instant::now();
                         }
                         _ => bail!("Windows audio stopped responding."),
@@ -776,6 +905,8 @@ fn generation(config: &Config, shared: &Shared, model: &mut VoxLock, tap: &Tap) 
             result
         });
         let process = (|| -> Result<()> {
+            let _priority = (config.processing.backend == Backend::Cpu)
+                .then(AudioPriority::register_processing);
             while !shared.stopped.load(Relaxed) {
                 match wasapi::wait([&shared.stop, &fault, &ready], 1500)? {
                     Some(0 | 1) => break,
@@ -855,6 +986,107 @@ fn generation(config: &Config, shared: &Shared, model: &mut VoxLock, tap: &Tap) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinguishes_device_loss_from_audio_overload() {
+        use windows::Win32::{
+            Foundation::ERROR_NOT_FOUND, Media::Audio::AUDCLNT_E_DEVICE_INVALIDATED,
+        };
+
+        for code in [ERROR_NOT_FOUND.to_hresult(), AUDCLNT_E_DEVICE_INVALIDATED] {
+            let error = anyhow::Error::from(windows::core::Error::from(code))
+                .context("Open the selected microphone");
+            assert!(wasapi::device_unavailable(&error));
+        }
+        assert!(!wasapi::device_unavailable(&CaptureOverrun.into()));
+    }
+
+    #[test]
+    fn repeated_cpu_overruns_raise_the_batch_even_after_brief_recoveries() -> Result<()> {
+        let mut recovery = RouteRecovery::default();
+        let first = Instant::now();
+        let overrun = || anyhow::Error::new(CaptureOverrun).context("Read the microphone");
+        for seconds in [8, 16] {
+            let now = first + Duration::from_secs(seconds);
+            assert_eq!(
+                recovery.larger_cpu_batch(Backend::Cpu, 16, 40, now, &overrun()),
+                None
+            );
+            assert_eq!(
+                recovery.retry_delay(now - Duration::from_secs(8), now, overrun())?,
+                500
+            );
+        }
+        let now = first + Duration::from_secs(24);
+        let device_error = anyhow::anyhow!("Device error");
+        assert_eq!(
+            recovery.larger_cpu_batch(Backend::Cpu, 16, 40, now, &device_error),
+            None
+        );
+        assert_eq!(
+            recovery.larger_cpu_batch(Backend::Cuda, 16, 40, now, &overrun()),
+            None
+        );
+        assert_eq!(
+            recovery.larger_cpu_batch(Backend::Cpu, 16, 16, now, &overrun()),
+            None
+        );
+        assert_eq!(
+            recovery.larger_cpu_batch(Backend::Cpu, 16, 40, now, &overrun()),
+            Some(24)
+        );
+        assert_eq!(
+            recovery.larger_cpu_batch(Backend::Cpu, 24, 40, now, &overrun()),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn isolated_cpu_overruns_age_out_of_the_batch_adjustment_window() {
+        let mut recovery = RouteRecovery::default();
+        let first = Instant::now();
+        for seconds in [0, 25, 31] {
+            let now = first + Duration::from_secs(seconds);
+            assert_eq!(
+                recovery.larger_cpu_batch(Backend::Cpu, 24, 32, now, &CaptureOverrun.into()),
+                None
+            );
+        }
+        let now = first + Duration::from_secs(40);
+        assert_eq!(
+            recovery.larger_cpu_batch(Backend::Cpu, 24, 32, now, &CaptureOverrun.into()),
+            Some(32)
+        );
+    }
+
+    #[test]
+    fn capture_overrun_retries_through_a_burst_and_stops_on_sustained_overload() -> Result<()> {
+        let mut recovery = RouteRecovery::default();
+        let first = Instant::now();
+        for millis in [0, 500, 1000, 1500, 2000, 5000] {
+            let now = first + Duration::from_millis(millis);
+            let error = anyhow::Error::new(CaptureOverrun).context("Read the microphone");
+            assert_eq!(recovery.retry_delay(now, now, error)?, 500);
+        }
+        let almost_expired = first + RECOVERY_WINDOW - Duration::from_millis(250);
+        assert_eq!(
+            recovery.retry_delay(almost_expired, almost_expired, CaptureOverrun.into())?,
+            250
+        );
+        let expired = first + RECOVERY_WINDOW;
+        let error = recovery
+            .retry_delay(expired, expired, CaptureOverrun.into())
+            .unwrap_err();
+        assert!(error.is::<CaptureOverrun>());
+
+        let after_steady_run = expired + Duration::from_secs(5);
+        assert_eq!(
+            recovery.retry_delay(expired, after_steady_run, CaptureOverrun.into())?,
+            500
+        );
+        Ok(())
+    }
 
     #[cfg(not(feature = "cpu-only"))]
     #[test]

@@ -11,7 +11,9 @@ use anyhow::{Context, Result, bail, ensure};
 use windows::{
     Win32::{
         Devices::FunctionDiscovery::{PKEY_Device_FriendlyName, PKEY_DeviceInterface_FriendlyName},
-        Foundation::{CloseHandle, HANDLE, PROPERTYKEY, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Foundation::{
+            CloseHandle, ERROR_NOT_FOUND, HANDLE, PROPERTYKEY, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        },
         Media::{Audio::*, Multimedia::WAVE_FORMAT_IEEE_FLOAT},
         System::{
             Com::{
@@ -87,7 +89,16 @@ pub struct AudioPriority(Option<HANDLE>);
 
 impl AudioPriority {
     pub fn register() -> Self {
-        Self(unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut 0) }.ok())
+        Self::register_task(w!("Pro Audio"))
+    }
+
+    pub fn register_processing() -> Self {
+        // Keep capture and render in the higher-priority Pro Audio task.
+        Self::register_task(w!("Audio"))
+    }
+
+    fn register_task(task: PCWSTR) -> Self {
+        Self(unsafe { AvSetMmThreadCharacteristicsW(task, &mut 0) }.ok())
     }
 }
 
@@ -202,6 +213,19 @@ pub fn enumerate() -> Result<Devices> {
         cables,
         default_mic,
     })
+}
+
+pub(crate) fn device_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<windows::core::Error>()
+        .is_some_and(|error| {
+            matches!(
+                error.code(),
+                AUDCLNT_E_DEVICE_INVALIDATED
+                    | AUDCLNT_E_RESOURCES_INVALIDATED
+                    | AUDCLNT_E_SERVICE_NOT_RUNNING
+            ) || error.code() == ERROR_NOT_FOUND.to_hresult()
+        })
 }
 
 pub fn cable_recording_id(devices: &IMMDeviceEnumerator, selected: &str) -> Result<String> {

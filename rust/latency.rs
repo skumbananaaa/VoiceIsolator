@@ -6,6 +6,7 @@ use anyhow::{Context, Result, ensure};
 use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::{
+    fmt,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
     time::{Duration, Instant},
 };
@@ -19,7 +20,7 @@ const ANALYSIS_RATE: usize = 2000;
 const BIN_TICKS: u64 = 10_000_000 / ANALYSIS_RATE as u64;
 const FRAME_TICKS: u64 = 10_000_000 / RATE as u64;
 const WINDOW: usize = 480;
-const MAX_LAG: usize = ANALYSIS_RATE / 2;
+const MAX_LAG: usize = ANALYSIS_RATE;
 const ENVELOPE_STRIDE: usize = 10;
 const ABSENT: f32 = f32::NAN;
 
@@ -31,6 +32,63 @@ pub struct Latency {
     pub eligible_windows: usize,
     pub approximate: bool,
     pub gaps_skipped: bool,
+    #[serde(default)]
+    pub packet_ages: PacketAges,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PacketAges {
+    mic: Option<PacketAge>,
+    cable: Option<PacketAge>,
+}
+
+impl PacketAges {
+    pub fn available(&self) -> bool {
+        self.mic.is_some() || self.cable.is_some()
+    }
+}
+
+impl fmt::Display for PacketAges {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn display(age: &Option<PacketAge>) -> String {
+            age.as_ref().map_or_else(
+                || "unavailable".to_owned(),
+                |age| format!("{:.1} ms median / {:.1} ms p95", age.median_ms, age.p95_ms),
+            )
+        }
+        write!(
+            f,
+            "Packet age\nMic  {}\nCABLE Output  {}",
+            display(&self.mic),
+            display(&self.cable)
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PacketAge {
+    median_ms: f64,
+    p95_ms: f64,
+}
+
+impl PacketAge {
+    fn summarize(mut ages: Vec<u64>) -> Option<Self> {
+        if ages.len() < 4 {
+            return None;
+        }
+        ages.sort_unstable();
+        let percentile_ms = |p: usize| ages[(ages.len() * p).div_ceil(100) - 1] as f64 / 10_000.0;
+        Some(Self {
+            median_ms: percentile_ms(50),
+            p95_ms: percentile_ms(95),
+        })
+    }
+}
+
+fn packet_age_ticks(first_tick: u64, frames: usize, read_tick: u64) -> Option<u64> {
+    // Use the newest frame so a larger packet does not inflate the delivery age.
+    let last_tick = first_tick + frames.saturating_sub(1) as u64 * FRAME_TICKS;
+    read_tick.checked_sub(last_tick)
 }
 
 const PACKET_SIZE: usize = 256;
@@ -39,6 +97,7 @@ struct TapPacket {
     audio: [f32; PACKET_SIZE],
     frames: usize,
     tick: u64,
+    age_ticks: Option<u64>,
 }
 
 pub(crate) struct Tap {
@@ -64,6 +123,9 @@ impl Tap {
             return;
         }
         let Some(tick) = packet.tick else { return };
+        let mut age_ticks = ticks()
+            .ok()
+            .and_then(|read_tick| packet_age_ticks(tick, packet.frames, read_tick));
         for offset in (0..packet.frames).step_by(PACKET_SIZE) {
             let frames = (packet.frames - offset).min(PACKET_SIZE);
             let mut audio = [0.0; PACKET_SIZE];
@@ -76,6 +138,7 @@ impl Tap {
                     audio,
                     frames,
                     tick: tick + offset as u64 * FRAME_TICKS,
+                    age_ticks: age_ticks.take(),
                 })
                 .is_err()
             {
@@ -179,6 +242,7 @@ fn summarize(mut delays: Vec<f64>, eligible: usize, approximate: bool) -> Option
         eligible_windows: eligible,
         approximate,
         gaps_skipped: false,
+        packet_ages: PacketAges::default(),
     })
 }
 
@@ -339,6 +403,8 @@ pub(crate) fn measure(
     let origin = ticks()?;
     let mut mic = Signal::new(origin);
     let mut output = Signal::new(origin);
+    let mut mic_ages = Vec::new();
+    let mut cable_ages = Vec::new();
     let _priority = wasapi::AudioPriority::register();
     let start = Instant::now();
     let (_, mut underruns, mut recoveries) = playback();
@@ -361,6 +427,7 @@ pub(crate) fn measure(
             "Latency measurement canceled."
         );
         while let Ok(packet) = tap.receiver.try_recv() {
+            mic_ages.extend(packet.age_ticks);
             mic.add(
                 Some(&packet.audio[..packet.frames]),
                 packet.frames,
@@ -373,6 +440,7 @@ pub(crate) fn measure(
                 if packet.gap {
                     output.exclude(previous_end.min(tick), end);
                 } else {
+                    cable_ages.extend(packet_age_ticks(tick, packet.frames, ticks()?));
                     output.add(packet.samples, packet.frames, tick);
                 }
                 previous_end = end;
@@ -393,8 +461,24 @@ pub(crate) fn measure(
         tap.dropped.load(Relaxed) == initial_drops,
         "The latency sampler fell behind. Try again."
     );
-    let skipped = output.bins.iter().any(|b| b.excluded);
-    let mut result = if let Some(result) = waveform(&mic.samples(), &output.samples(), &canceled) {
+    let packet_ages = PacketAges {
+        mic: PacketAge::summarize(mic_ages),
+        cable: PacketAge::summarize(cable_ages),
+    };
+    let mut result = match_signals(&mic, &output, &canceled).map_err(|error| {
+        if packet_ages.available() && !canceled() {
+            anyhow::anyhow!("{error:#}\n{packet_ages}")
+        } else {
+            error
+        }
+    })?;
+    result.gaps_skipped = output.bins.iter().any(|b| b.excluded);
+    result.packet_ages = packet_ages;
+    Ok(result)
+}
+
+fn match_signals(mic: &Signal, output: &Signal, canceled: &impl Fn() -> bool) -> Result<Latency> {
+    let result = if let Some(result) = waveform(&mic.samples(), &output.samples(), canceled) {
         result
     } else {
         ensure!(!canceled(), "Latency measurement canceled.");
@@ -416,16 +500,30 @@ pub(crate) fn measure(
             output.iter().filter(|&&x| x > 2.0_f32.ln()).count() >= 40,
             "Cable too quiet. Check the isolated level meter."
         );
-        envelope(&mic, &output, &canceled)
+        envelope(&mic, &output, canceled)
             .context("No reliable match. Speak alone in short phrases.")?
     };
-    result.gaps_skipped = skipped;
     Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packet_age_uses_the_newest_frame_and_reports_tail_delay() {
+        let frames = 160;
+        let first_tick = 1_000_000;
+        let last_tick = first_tick + 159 * FRAME_TICKS;
+        assert_eq!(packet_age_ticks(first_tick, frames, last_tick - 1), None);
+        let ages = (1..=20)
+            .rev()
+            .filter_map(|ms| packet_age_ticks(first_tick, frames, last_tick + ms * 10_000))
+            .collect();
+        let summary = PacketAge::summarize(ages).unwrap();
+        assert_eq!(summary.median_ms, 10.0);
+        assert_eq!(summary.p95_ms, 19.0);
+    }
 
     #[test]
     fn finds_known_lag_with_gap_and_gain() {
@@ -436,15 +534,16 @@ mod tests {
                 state as f32 / u32::MAX as f32 * 0.1 - 0.05
             })
             .collect();
-        let mut cable = vec![0.0; mic.len()];
-        let offset = 137;
-        for i in offset..cable.len() {
-            cable[i] = mic[i - offset] * 0.3;
+        for (offset, expected_ms) in [(137, 68.5), (1250, 625.0)] {
+            let mut cable = vec![0.0; mic.len()];
+            for i in offset..cable.len() {
+                cable[i] = mic[i - offset] * 0.3;
+            }
+            cable[1000..1900].fill(ABSENT);
+            let result = waveform(&mic, &cable, &|| false).unwrap();
+            assert_eq!(result.median_ms, expected_ms);
+            assert_eq!(result.p95_ms, expected_ms);
+            assert!(result.windows < result.eligible_windows);
         }
-        cable[1000..1900].fill(ABSENT);
-        let result = waveform(&mic, &cable, &|| false).unwrap();
-        assert_eq!(result.median_ms, 68.5);
-        assert_eq!(result.p95_ms, 68.5);
-        assert!(result.windows < result.eligible_windows);
     }
 }

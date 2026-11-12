@@ -31,6 +31,7 @@ VersionInfoVersion={#AppVersion}.0
 LicenseFile={#Payload}\licenses\Microsoft-VC-Runtime-License.txt
 
 [Tasks]
+Name: "startup"; Description: "Start VoiceIsolator when I sign in to Windows"; Flags: unchecked; Check: FreshInstall
 Name: "cuda"; Description: "Install NVIDIA CUDA support (about 1.6 GiB on first install)"; Flags: unchecked
 
 [InstallDelete]
@@ -66,6 +67,7 @@ Name: "{group}\VoiceIsolator"; Filename: "{app}\voiceisolator_live.exe"; Working
 [Registry]
 Root: HKCU; Subkey: "Software\VoiceIsolator"; ValueType: string; ValueName: "InstalledVersion"; ValueData: "{#AppVersion}"; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "VoiceIsolator"; Flags: uninsdeletevalue dontcreatekey
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "VoiceIsolator"; ValueData: """{app}\voiceisolator_live.exe"" --startup"; Flags: uninsdeletevalue; Check: RegisterStartup
 
 [Run]
 Filename: "{app}\voiceisolator_live.exe"; Parameters: "--after-update"; WorkingDir: "{app}"; Flags: nowait skipifsilent; Check: FromUpdate
@@ -75,9 +77,10 @@ Filename: "{app}\voiceisolator_live.exe"; Description: "Open VoiceIsolator"; Wor
 const
   SynchronizeAccess = $00100000;
   ErrorInvalidParameter = 87;
+  StartupKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
 
 var
-  WizardStarted, InstallFinished: Boolean;
+  WizardStarted, InstallFinished, AlreadyInstalled: Boolean;
 
 #include "Cuda.iss"
 
@@ -100,6 +103,17 @@ begin
   Result := UpdateProcessId() > 0;
 end;
 
+function FreshInstall(): Boolean;
+begin
+  Result := not AlreadyInstalled;
+end;
+
+function RegisterStartup(): Boolean;
+begin
+  Result := (WizardIsTaskSelected('startup') or RegValueExists(HKCU, StartupKey, 'VoiceIsolator'))
+    and (Length(ExpandConstant('"{app}\voiceisolator_live.exe" --startup')) < 260);
+end;
+
 function InitializeSetup(): Boolean;
 var
   Installed: String;
@@ -107,7 +121,8 @@ var
   ProcessHandle: THandle;
 begin
   Result := False;
-  if RegQueryStringValue(HKCU, 'Software\VoiceIsolator', 'InstalledVersion', Installed) then
+  AlreadyInstalled := RegQueryStringValue(HKCU, 'Software\VoiceIsolator', 'InstalledVersion', Installed);
+  if AlreadyInstalled then
     if StrToVersion(Installed + '.0', PreviousVersion) and StrToVersion('{#AppVersion}.0', NewVersion) then
       if ComparePackedVersion(NewVersion, PreviousVersion) < 0 then begin
         SuppressibleMsgBox('A newer version of VoiceIsolator is already installed.', mbError, MB_OK, IDOK);
