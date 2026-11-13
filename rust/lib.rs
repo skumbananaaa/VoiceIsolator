@@ -1,4 +1,5 @@
 mod cuda;
+mod diagnostics;
 pub mod engine;
 pub mod isolation;
 pub mod latency;

@@ -923,6 +923,12 @@ impl Desktop {
                 }
             });
             ui.menu_button("Settings", |ui| {
+                if ui.button("Open diagnostic logs").clicked() {
+                    if let Err(error) = engine::open_diagnostic_logs() {
+                        self.notice = Some((true, format!("Could not open diagnostic logs. {error:#}")));
+                    }
+                    ui.close();
+                }
                 if ui.button("Reset processing settings").clicked() {
                     self.processing = Processing::default();
                     self.gains = Gains::default();

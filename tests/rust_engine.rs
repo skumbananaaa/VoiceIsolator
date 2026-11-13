@@ -77,3 +77,33 @@ fn run_child(app_data: &Path, config: &Config) -> anyhow::Result<Vec<serde_json:
         .map(serde_json::from_str::<serde_json::Value>)
         .collect::<Result<Vec<_>, _>>()?)
 }
+
+#[test]
+fn workers_append_distinct_sessions_to_the_same_diagnostic_log() -> anyhow::Result<()> {
+    let app_data = tempfile::tempdir()?;
+    let mut config = default_config("private microphone".to_owned(), "private cable".to_owned());
+    config.voice_profile = Some("Private voice".to_owned());
+    for _ in 0..2 {
+        run_child(app_data.path(), &config)?;
+    }
+    let log = std::fs::read_to_string(app_data.path().join("VoiceIsolator/logs/diagnostics.log"))?;
+    assert!(!log.to_lowercase().contains("private"));
+    let records = log
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(records.len(), 4);
+    for pair in records.chunks_exact(2) {
+        assert_eq!(pair[0]["event"], "session_started");
+        assert_eq!(pair[1]["event"], "session_ended");
+        assert_eq!(pair[1]["outcome"], "startup_failed");
+        assert!(
+            pair[0]["time_utc"]
+                .as_str()
+                .is_some_and(|time| time.ends_with('Z'))
+        );
+        assert_eq!(pair[0]["session"], pair[1]["session"]);
+    }
+    assert_ne!(records[0]["session"], records[2]["session"]);
+    Ok(())
+}

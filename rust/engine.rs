@@ -17,6 +17,7 @@ use std::{
 
 use crate::{
     RATE,
+    diagnostics::{self, Event as DiagnosticEvent, Recorder},
     isolation::{Backend, VoxLock, default_models},
     latency::{self, Latency, Tap},
     playback::{self, Correction, Playback},
@@ -553,6 +554,7 @@ fn child_session(
         meters: Meters::default(),
     });
     let tap = Tap::new();
+    let diagnostics = Recorder::start(&config.processing);
     let (measure_tx, measure_rx) = crossbeam_channel::bounded(1);
     let (result_tx, result_rx) = crossbeam_channel::bounded(1);
     let commands = shared.clone();
@@ -586,9 +588,11 @@ fn child_session(
         }
         commands.stop();
     });
-    thread::scope(|scope| {
+    let result = thread::scope(|scope| {
         scope.spawn(|| {
             let mut writer = BufWriter::new(io::stdout().lock());
+            let mut last_timing = Instant::now();
+            let mut last_counts = (0, 0);
             loop {
                 if let Ok(result) = result_rx.try_recv() {
                     if send(&mut writer, &Update::Measured(result)).is_err() {
@@ -599,7 +603,18 @@ fn child_session(
                 if shared.stopped.load(Relaxed) {
                     break;
                 }
-                if send(&mut writer, &Update::Status(shared.meters.snapshot())).is_err() {
+                let status = shared.meters.snapshot();
+                if last_timing.elapsed() >= Duration::from_secs(1) {
+                    last_timing = Instant::now();
+                    let counts = (status.underruns, status.batch_deadline_misses);
+                    if counts != last_counts {
+                        last_counts = counts;
+                        diagnostics.record(DiagnosticEvent::Timing {
+                            counters: (&status).into(),
+                        });
+                    }
+                }
+                if send(&mut writer, &Update::Status(status)).is_err() {
                     shared.stop();
                     break;
                 }
@@ -607,25 +622,33 @@ fn child_session(
             }
         });
         scope.spawn(|| {
+            let mut id = 0;
             while !shared.stopped.load(Relaxed) {
                 match measure_rx.recv_timeout(Duration::from_millis(40)) {
                     Ok(()) => {
-                        let result = latency::measure(
-                            &config.cable,
-                            &shared.stop,
-                            &tap,
-                            || {
-                                shared.stopped.load(Relaxed)
-                                    || shared.cancel_measurement.load(Relaxed)
-                            },
-                            || {
+                        id += 1;
+                        let canceled = || {
+                            shared.stopped.load(Relaxed) || shared.cancel_measurement.load(Relaxed)
+                        };
+                        let result =
+                            latency::measure(&config.cable, &shared.stop, &tap, canceled, || {
                                 (
                                     shared.meters.live.load(Relaxed),
                                     shared.meters.underruns.load(Relaxed),
                                     shared.meters.recoveries.load(Relaxed),
                                 )
+                            });
+                        diagnostics.record(DiagnosticEvent::LatencyMeasurement {
+                            id,
+                            outcome: if result.is_ok() {
+                                "completed"
+                            } else if canceled() {
+                                "canceled"
+                            } else {
+                                "failed"
                             },
-                        );
+                            result: result.as_ref().ok().cloned(),
+                        });
                         let _ = result_tx.try_send(result.map_err(|error| format!("{error:#}")));
                         shared.measuring.store(false, Relaxed);
                     }
@@ -634,10 +657,27 @@ fn child_session(
                 }
             }
         });
-        let result = run_audio(config, &shared, &tap);
+        let result = run_audio(config, &shared, &tap, &diagnostics);
         shared.stop();
         result
-    })
+    });
+    let status = shared.meters.snapshot();
+    let outcome = if result.is_ok() {
+        "stopped"
+    } else if status.model_ready {
+        "audio_failed"
+    } else {
+        "startup_failed"
+    };
+    diagnostics.finish(outcome, &status);
+    result
+}
+
+pub fn open_diagnostic_logs() -> Result<()> {
+    let directory = diagnostics::directory()?;
+    std::fs::create_dir_all(&directory)?;
+    Command::new("explorer.exe").arg(directory).spawn()?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -710,7 +750,7 @@ impl RouteRecovery {
     }
 }
 
-fn run_audio(config: &Config, shared: &Shared, tap: &Tap) -> Result<()> {
+fn run_audio(config: &Config, shared: &Shared, tap: &Tap, diagnostics: &Recorder) -> Result<()> {
     let path = preferences::named_profile_path(
         &preferences::profile_path()?,
         config.voice_profile.as_deref(),
@@ -754,32 +794,60 @@ fn run_audio(config: &Config, shared: &Shared, tap: &Tap) -> Result<()> {
             batch_ms,
             &max_batch_ms,
             prefer_short_period,
+            diagnostics,
         );
         shared.meters.live.store(false, Relaxed);
         if shared.stopped.load(Relaxed) {
             return Ok(());
         }
         let error = result.err().context("Audio route stopped unexpectedly")?;
+        let reason = if wasapi::device_unavailable(&error) {
+            "audio device disconnected"
+        } else if error.is::<CaptureOverrun>() {
+            "capture backlog"
+        } else if error.is::<RenderFault>() {
+            "cable render failure"
+        } else if let Some(fault) = error.downcast_ref::<RouteFault>() {
+            fault.reason
+        } else {
+            "audio route interrupted"
+        };
         let now = Instant::now();
         let limit = max_batch_ms.load(Relaxed);
-        let retry_ms =
+        let previous_batch_ms = batch_ms;
+        let (action, retry_ms) =
             if shared.meters.short_render_rate.load(Relaxed) != 0 && error.is::<RenderFault>() {
                 prefer_short_period = false;
-                0
+                ("retry_legacy_wasapi", Ok(0))
             } else if (processing.batch_ms..batch_ms).contains(&limit) {
                 // Reopening a device can change its audio period.
                 batch_ms = limit;
                 recovery = RouteRecovery::default();
-                0
+                ("reduce_batch_for_audio_period", Ok(0))
             } else if let Some(larger) =
                 recovery.larger_cpu_batch(processing.backend, batch_ms, limit, now, &error)
             {
                 batch_ms = larger;
-                0
+                ("increase_batch_after_cpu_overruns", Ok(0))
             } else {
-                recovery.retry_delay(start, now, error)?
+                ("retry", recovery.retry_delay(start, now, error))
             };
-        shared.meters.recoveries.fetch_add(1, Relaxed);
+        if retry_ms.is_ok() {
+            shared.meters.recoveries.fetch_add(1, Relaxed);
+        }
+        diagnostics.record(DiagnosticEvent::RouteInterrupted {
+            reason,
+            action: if retry_ms.is_ok() {
+                action
+            } else {
+                "stop_after_retries"
+            },
+            batch_ms_before: previous_batch_ms,
+            batch_ms_after: batch_ms,
+            retry_delay_ms: retry_ms.as_ref().ok().copied(),
+            counters: (&shared.meters.snapshot()).into(),
+        });
+        let retry_ms = retry_ms?;
         shared.meters.heartbeat.fetch_add(1, Relaxed);
         let _ = wasapi::wait([&shared.stop], retry_ms)?;
         if !shared.stopped.load(Relaxed) {
@@ -805,6 +873,20 @@ impl fmt::Display for RenderFault {
 
 impl std::error::Error for RenderFault {}
 
+#[derive(Debug)]
+struct RouteFault {
+    reason: &'static str,
+    message: &'static str,
+}
+
+impl fmt::Display for RouteFault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for RouteFault {}
+
 fn generation(
     config: &Config,
     shared: &Shared,
@@ -813,6 +895,7 @@ fn generation(
     batch_ms: usize,
     max_batch_ms: &AtomicUsize,
     prefer_short_period: bool,
+    diagnostics: &Recorder,
 ) -> Result<()> {
     let batch = batch_ms * RATE / 1000;
     let budget = Duration::from_millis(batch_ms as u64);
@@ -887,6 +970,18 @@ fn generation(
                 }
                 capture.start()?;
                 render.start().context(RenderFault)?;
+                diagnostics.record(DiagnosticEvent::RouteOpened {
+                    batch_ms,
+                    wasapi: if short_rate.is_some() {
+                        "short_period"
+                    } else {
+                        "legacy"
+                    },
+                    capture_period_frames: capture_period,
+                    render_period_frames: render_period,
+                    render_rate_hz: render_rate,
+                    render_period_ms: 1000.0 * render_period as f64 / render_rate as f64,
+                });
                 let mut last = [Instant::now(); 2];
                 loop {
                     match wasapi::wait(
@@ -897,7 +992,13 @@ fn generation(
                         Some(2) => {
                             let captured = capture
                                 .capture(|packet| {
-                                    ensure!(!packet.gap, "Microphone stream was interrupted.");
+                                    ensure!(
+                                        !packet.gap,
+                                        RouteFault {
+                                            reason: "microphone discontinuity",
+                                            message: "Microphone stream was interrupted.",
+                                        }
+                                    );
                                     tap.push(&packet);
                                     let frames = partial_batch + packet.frames;
                                     let complete = frames / batch;
@@ -1038,7 +1139,10 @@ fn generation(
                     shared.meters.timing.complete(arrived.elapsed(), budget);
                     ensure!(
                         written == filtered.len(),
-                        "The virtual cable fell behind isolation."
+                        RouteFault {
+                            reason: "model output stalled",
+                            message: "The virtual cable fell behind isolation.",
+                        }
                     );
                 }
             }
