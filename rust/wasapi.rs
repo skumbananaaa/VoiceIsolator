@@ -14,7 +14,10 @@ use windows::{
         Foundation::{
             CloseHandle, ERROR_NOT_FOUND, HANDLE, PROPERTYKEY, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
-        Media::{Audio::*, Multimedia::WAVE_FORMAT_IEEE_FLOAT},
+        Media::{
+            Audio::*,
+            Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT},
+        },
         System::{
             Com::{
                 CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
@@ -263,8 +266,105 @@ pub struct Stream {
     render: Option<IAudioRenderClient>,
     pub event: Event,
     pub capacity: usize,
+    short_render: Option<ShortRender>,
     started: bool,
     seen: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ShortRender {
+    rate: usize,
+    channels: usize,
+    period: usize,
+}
+
+struct MixFormat(*mut WAVEFORMATEX);
+
+impl Drop for MixFormat {
+    fn drop(&mut self) {
+        unsafe { CoTaskMemFree(Some(self.0.cast())) };
+    }
+}
+
+fn short_period(rate: u32, fundamental: u32, min: u32, max: u32) -> Option<u32> {
+    if fundamental == 0 || min == 0 || min > max {
+        return None;
+    }
+    let smallest = min.div_ceil(fundamental);
+    let largest = max / fundamental;
+    if smallest > largest {
+        return None;
+    }
+    let target = (rate / 200).div_ceil(fundamental);
+    Some(target.clamp(smallest, largest) * fundamental)
+}
+
+fn shorter_than_legacy(period: u32, rate: u32, legacy_hns: i64) -> bool {
+    i64::from(period) * 10_000_000 < legacy_hns * i64::from(rate)
+}
+
+fn open_short_render(device: &IMMDevice) -> Result<(IAudioClient, ShortRender)> {
+    const EXTENSIBLE: u16 = 0xfffe;
+    unsafe {
+        let client: IAudioClient3 = device.Activate(CLSCTX_INPROC_SERVER, None)?;
+        let format = MixFormat(client.GetMixFormat()?);
+        ensure!(!format.0.is_null(), "Missing cable mix format");
+        let spec = format.0.read();
+        let rate = spec.nSamplesPerSec;
+        let channels = spec.nChannels;
+        ensure!(
+            (RATE as u32..=192_000).contains(&rate)
+                && matches!(channels, 1 | 2)
+                && spec.wBitsPerSample == 32
+                && spec.nBlockAlign == channels * 4,
+            "Unsupported cable mix format"
+        );
+        let float = spec.wFormatTag == WAVE_FORMAT_IEEE_FLOAT as u16
+            || (spec.wFormatTag == EXTENSIBLE
+                && spec.cbSize as usize
+                    >= size_of::<WAVEFORMATEXTENSIBLE>() - size_of::<WAVEFORMATEX>()
+                && {
+                    let extended = format.0.cast::<WAVEFORMATEXTENSIBLE>().read();
+                    let subtype = extended.SubFormat;
+                    subtype == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+                        && extended.Samples.wValidBitsPerSample == 32
+                });
+        ensure!(float, "Cable mix format is not float PCM");
+        let (mut fundamental, mut min, mut max) = (0, 0, 0);
+        client.GetSharedModeEnginePeriod(format.0, &mut 0, &mut fundamental, &mut min, &mut max)?;
+        let period = short_period(rate, fundamental, min, max).context("No cable audio period")?;
+        let mut legacy = 0;
+        client.GetDevicePeriod(Some(&mut legacy), None)?;
+        ensure!(
+            (1..=10_000_000).contains(&legacy) && shorter_than_legacy(period, rate, legacy),
+            "Cable does not offer a shorter render period"
+        );
+        client.InitializeSharedAudioStream(
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            period,
+            format.0,
+            None,
+        )?;
+        let mut actual_format = MixFormat(ptr::null_mut());
+        let mut actual = 0;
+        client.GetCurrentSharedModeEnginePeriod(&mut actual_format.0, &mut actual)?;
+        ensure!(
+            !actual_format.0.is_null()
+                && (*actual_format.0).nSamplesPerSec == rate
+                && (min..=max).contains(&actual)
+                && actual.is_multiple_of(fundamental)
+                && shorter_than_legacy(actual, rate, legacy),
+            "Windows did not open a shorter cable period"
+        );
+        Ok((
+            client.cast()?,
+            ShortRender {
+                rate: rate as usize,
+                channels: channels as usize,
+                period: actual as usize,
+            },
+        ))
+    }
 }
 
 impl Stream {
@@ -274,16 +374,42 @@ impl Stream {
         direction: EDataFlow,
         cable: bool,
     ) -> Result<Self> {
-        let event = Event::new(false)?;
+        Self::open_endpoint(devices, id, direction, cable, false)
+    }
+
+    pub(crate) fn open_render(
+        devices: &IMMDeviceEnumerator,
+        id: &str,
+        prefer_short_period: bool,
+    ) -> Result<Self> {
+        Self::open_endpoint(devices, id, eRender, true, prefer_short_period)
+    }
+
+    fn open_endpoint(
+        devices: &IMMDeviceEnumerator,
+        id: &str,
+        direction: EDataFlow,
+        cable: bool,
+        prefer_short_period: bool,
+    ) -> Result<Self> {
         unsafe {
             let device = devices
                 .GetDevice(&HSTRING::from(id))
                 .context("Find selected audio endpoint")?;
             let endpoint: IMMEndpoint = device.cast()?;
+            let (_, is_cable, vb_cable) = names(&device)?;
             ensure!(
-                endpoint.GetDataFlow()? == direction && names(&device)?.1 == cable,
+                endpoint.GetDataFlow()? == direction && is_cable == cable,
                 "Choose a microphone and a recognized virtual cable"
             );
+            if prefer_short_period
+                && vb_cable
+                && let Ok((client, spec)) = open_short_render(&device)
+                && let Ok(stream) = Self::initialized(client, direction, Some(spec))
+            {
+                return Ok(stream);
+            }
+            // A failed or partially initialized client cannot be reused.
             let client: IAudioClient = device.Activate(CLSCTX_INPROC_SERVER, None)?;
             let format = WAVEFORMATEX {
                 wFormatTag: WAVE_FORMAT_IEEE_FLOAT as u16,
@@ -301,6 +427,17 @@ impl Stream {
             client
                 .Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, &format, None)
                 .context("Open Windows audio in shared mode")?;
+            Self::initialized(client, direction, None)
+        }
+    }
+
+    fn initialized(
+        client: IAudioClient,
+        direction: EDataFlow,
+        short_render: Option<ShortRender>,
+    ) -> Result<Self> {
+        let event = Event::new(false)?;
+        unsafe {
             client.SetEventHandle(event.0)?;
             let (capture, render) = if direction == eCapture {
                 (Some(client.GetService()?), None)
@@ -314,6 +451,7 @@ impl Stream {
                 render,
                 event,
                 capacity,
+                short_render,
                 started: false,
                 seen: false,
             })
@@ -321,6 +459,9 @@ impl Stream {
     }
 
     pub fn period(&self) -> Result<usize> {
+        if let Some(spec) = self.short_render {
+            return Ok(spec.period);
+        }
         let mut period = 0;
         unsafe {
             self.client.GetDevicePeriod(Some(&mut period), None)?;
@@ -330,6 +471,10 @@ impl Stream {
             "Invalid Windows audio period"
         );
         Ok((period as usize * RATE).div_ceil(10_000_000))
+    }
+
+    pub(crate) fn short_render_rate(&self) -> Option<usize> {
+        self.short_render.map(|spec| spec.rate)
     }
 
     pub fn start(&mut self) -> Result<()> {
@@ -374,7 +519,7 @@ impl Stream {
         Ok(received)
     }
 
-    pub fn render(&self, target: usize, produce: impl FnOnce(&mut [f32]) -> bool) -> Result<()> {
+    pub fn render(&self, target: usize, produce: impl FnOnce(&mut [f32]) -> bool) -> Result<usize> {
         let render = self
             .render
             .as_ref()
@@ -383,19 +528,26 @@ impl Stream {
             let padding = self.client.GetCurrentPadding()? as usize;
             let frames = target.min(self.capacity).saturating_sub(padding);
             if frames == 0 {
-                return Ok(());
+                return Ok(padding);
             }
             let ptr = render.GetBuffer(frames as u32)?;
-            ptr.write_bytes(0, frames * size_of::<f32>());
-            let samples = slice::from_raw_parts_mut(ptr.cast::<f32>(), frames);
-            let flags = if produce(samples) {
+            let channels = self.short_render.map_or(1, |spec| spec.channels);
+            ptr.write_bytes(0, frames * channels * size_of::<f32>());
+            let samples = slice::from_raw_parts_mut(ptr.cast::<f32>(), frames * channels);
+            let flags = if produce(&mut samples[..frames]) {
+                if channels == 2 {
+                    for frame in (0..frames).rev() {
+                        let sample = samples[frame];
+                        samples[2 * frame..2 * frame + 2].fill(sample);
+                    }
+                }
                 0
             } else {
                 AUDCLNT_BUFFERFLAGS_SILENT.0 as u32
             };
             render.ReleaseBuffer(frames as u32, flags)?;
+            Ok(padding)
         }
-        Ok(())
     }
 }
 
@@ -478,4 +630,20 @@ pub fn record(id: &str, stop: &Event, mut level: impl FnMut(f32)) -> Result<Vec<
         }
     }
     select_enrollment(&recording)
+}
+
+#[cfg(test)]
+mod short_period_tests {
+    use super::*;
+    #[test]
+    fn short_render_period_respects_device_limits_and_improves_on_legacy() {
+        assert_eq!(short_period(48_000, 1, 128, 480), Some(240));
+        assert_eq!(short_period(48_000, 32, 128, 480), Some(256));
+        assert_eq!(short_period(44_100, 16, 128, 200), Some(192));
+        assert_eq!(short_period(48_000, 160, 320, 480), Some(320));
+        assert_eq!(short_period(48_000, 32, 241, 250), None);
+        assert_eq!(short_period(48_000, 0, 128, 480), None);
+        assert!(shorter_than_legacy(240, 48_000, 100_000));
+        assert!(!shorter_than_legacy(480, 48_000, 100_000));
+    }
 }

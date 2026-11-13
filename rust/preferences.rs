@@ -83,6 +83,62 @@ pub fn profile_path() -> Result<PathBuf> {
     .join("VoiceIsolator/voice-profile.dat"))
 }
 
+pub const MAX_PROFILE_NAME: usize = 40;
+pub const SAVED_VOICE: &str = "Saved voice";
+
+fn profile_name_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name == name.trim()
+        && name.encode_utf16().count() <= MAX_PROFILE_NAME
+        && !name.ends_with('.')
+        && !name
+            .chars()
+            .any(|c| c.is_control() || r#"<>:"/\|?*"#.contains(c))
+        && !name.eq_ignore_ascii_case(SAVED_VOICE)
+}
+
+pub fn named_profile_path(legacy: &Path, name: Option<&str>) -> Result<PathBuf> {
+    let Some(name) = name else {
+        return Ok(legacy.to_owned());
+    };
+    ensure!(
+        profile_name_valid(name),
+        "Use a name of 1–40 characters without Windows filename punctuation. \"Saved voice\" is reserved."
+    );
+    Ok(legacy
+        .with_file_name("profiles")
+        .join(format!("voice-{name}.dat")))
+}
+
+pub fn voice_profiles(legacy: &Path) -> Result<Vec<Option<String>>> {
+    let mut profiles = Vec::new();
+    if legacy.try_exists()? {
+        profiles.push(None);
+    }
+    let directory = legacy.with_file_name("profiles");
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(profiles),
+        Err(error) => return Err(error.into()),
+    };
+    let mut named = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && let Some(filename) = entry.file_name().to_str()
+            && let Some(name) = filename
+                .strip_prefix("voice-")
+                .and_then(|s| s.strip_suffix(".dat"))
+            && profile_name_valid(name)
+        {
+            named.push(Some(name.to_owned()));
+        }
+    }
+    named.sort_unstable();
+    profiles.extend(named);
+    Ok(profiles)
+}
+
 fn crypt(bytes: &mut [u8], encrypt: bool) -> Result<Blob> {
     let input = CRYPT_INTEGER_BLOB {
         cbData: bytes.len().try_into()?,
@@ -170,6 +226,14 @@ pub fn load_profile(path: &Path) -> Result<Option<Profile>> {
 }
 
 pub fn save_profile(path: &Path, profile: &Profile) -> Result<()> {
+    write_profile(path, profile, false)
+}
+
+pub fn create_profile(path: &Path, profile: &Profile) -> Result<()> {
+    write_profile(path, profile, true)
+}
+
+fn write_profile(path: &Path, profile: &Profile, create: bool) -> Result<()> {
     ensure!(
         valid(profile),
         "The recording cannot be saved as a voice profile"
@@ -192,7 +256,14 @@ pub fn save_profile(path: &Path, profile: &Profile) -> Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
     temporary.write_all(encrypted.data())?;
     temporary.as_file().sync_all()?;
-    temporary.into_temp_path().persist(path)?;
+    let temporary = temporary.into_temp_path();
+    if create {
+        temporary
+            .persist_noclobber(path)
+            .context("Use a name that is not already saved")?;
+    } else {
+        temporary.persist(path)?;
+    }
     Ok(())
 }
 
@@ -213,6 +284,8 @@ pub struct Choices {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub choices: Choices,
+    #[serde(default)]
+    pub voice_profile: Option<String>,
     pub processing: Processing,
     pub gains: Gains,
     pub dark: bool,
@@ -259,6 +332,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             choices: Choices::load(),
+            voice_profile: None,
             processing: Processing::default(),
             gains: Gains::default(),
             dark: dark_mode().unwrap_or(true),
@@ -417,6 +491,33 @@ pub fn dark_mode() -> Option<bool> {
 mod tests {
     use super::*;
     use crate::wasapi::Device;
+
+    #[test]
+    fn voice_profiles_keep_legacy_recording_and_refuse_to_overwrite_existing_names() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let legacy = directory.path().join("voice-profile.dat");
+        let recording = |sample| Profile {
+            microphone: "mic".into(),
+            samples: vec![sample; PROFILE_SAMPLES],
+        };
+        save_profile(&legacy, &recording(0.1))?;
+        let original = fs::read(&legacy)?;
+        let test = named_profile_path(&legacy, Some("Test voice"))?;
+        create_profile(&test, &recording(0.2))?;
+        assert!(create_profile(&test, &recording(0.3)).is_err());
+        assert_eq!(load_profile(&test)?.unwrap().samples[0], 0.2);
+        assert_eq!(
+            voice_profiles(&legacy)?,
+            vec![None, Some("Test voice".into())]
+        );
+        assert!(named_profile_path(&legacy, Some("../other")).is_err());
+        assert!(named_profile_path(&legacy, Some("saved voice")).is_err());
+        delete_profile(&test)?;
+        assert_eq!(voice_profiles(&legacy)?, vec![None]);
+        assert_eq!(fs::read(&legacy)?, original);
+        assert_eq!(load_profile(&legacy)?.unwrap().samples[0], 0.1);
+        Ok(())
+    }
 
     #[test]
     fn encrypted_profile_round_trip_and_replacement() -> Result<()> {

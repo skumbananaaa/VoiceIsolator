@@ -14,8 +14,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
-use crossbeam_channel::Receiver;
+use anyhow::{Context, Result};
+use crossbeam_channel::{Receiver, TryRecvError};
 use desktop_shell::{Action, Instance, State, Tray};
 use eframe::egui::{self, Color32, RichText, Stroke, Vec2, vec2};
 use voiceisolator::{
@@ -78,36 +78,31 @@ fn main() -> Result<()> {
 struct Recording {
     stop: Arc<Event>,
     level: Arc<AtomicU32>,
-    done: Receiver<Result<String>>,
+    done: Receiver<Result<Profile>>,
     since: Instant,
     canceled: bool,
 }
 
 impl Recording {
-    fn start(microphone: String, path: PathBuf) -> Result<Self> {
+    fn start(microphone: String, ctx: &egui::Context) -> Result<Self> {
         let stop = Arc::new(Event::new(true)?);
         let level = Arc::new(AtomicU32::new(0));
         let (send, done) = crossbeam_channel::bounded(1);
         let thread_stop = stop.clone();
         let thread_level = level.clone();
-        thread::spawn(move || {
-            let result = (|| -> Result<String> {
+        let ctx = ctx.clone();
+        thread::Builder::new()
+            .name("voice-enrollment".into())
+            .spawn(move || {
                 let samples = wasapi::record(&microphone, &thread_stop, |level| {
                     thread_level.fetch_max(level.to_bits(), Relaxed);
-                })?;
-                anyhow::ensure!(
-                    wasapi::wait([&thread_stop], 0)?.is_none(),
-                    "Recording canceled"
-                );
-                let profile = Profile {
+                });
+                let _ = send.send(samples.map(|samples| Profile {
                     microphone,
                     samples,
-                };
-                preferences::save_profile(&path, &profile)?;
-                Ok(profile.microphone.clone())
-            })();
-            let _ = send.send(result);
-        });
+                }));
+                ctx.request_repaint();
+            })?;
         Ok(Self {
             stop,
             level,
@@ -116,11 +111,74 @@ impl Recording {
             canceled: false,
         })
     }
+
+    fn cancel(&mut self) {
+        self.canceled = true;
+        self.stop.signal();
+    }
+
+    fn result(&self) -> Option<Result<Option<Profile>>> {
+        task_result(&self.done, "The recording task stopped unexpectedly.").map(|result| {
+            if self.canceled {
+                Ok(None)
+            } else {
+                result.map(Some)
+            }
+        })
+    }
 }
 
 impl Drop for Recording {
     fn drop(&mut self) {
         self.stop.signal();
+    }
+}
+
+enum Enrollment {
+    Recording(Recording),
+    Candidate(Arc<Profile>),
+    Saving(Receiver<Result<ProfileSave>>),
+}
+
+struct ProfileSave {
+    profile: Arc<Profile>,
+    new_name: Option<String>,
+    result: Result<()>,
+}
+
+impl Enrollment {
+    fn save(
+        profile: Arc<Profile>,
+        path: PathBuf,
+        new_name: Option<String>,
+        ctx: &egui::Context,
+    ) -> Result<Self> {
+        let (send, done) = crossbeam_channel::bounded(1);
+        let ctx = ctx.clone();
+        thread::Builder::new()
+            .name("voice-profile-save".into())
+            .spawn(move || {
+                let result = if new_name.is_some() {
+                    preferences::create_profile(&path, &profile)
+                } else {
+                    preferences::save_profile(&path, &profile)
+                };
+                let _ = send.send(Ok(ProfileSave {
+                    profile,
+                    new_name,
+                    result,
+                }));
+                ctx.request_repaint();
+            })?;
+        Ok(Self::Saving(done))
+    }
+}
+
+fn task_result<T>(receiver: &Receiver<Result<T>>, disconnected: &'static str) -> Option<Result<T>> {
+    match receiver.try_recv() {
+        Ok(result) => Some(result),
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!(disconnected))),
     }
 }
 
@@ -154,13 +212,15 @@ struct Desktop {
     choices: Choices,
     preferred: Choices,
     profile_path: Result<PathBuf, String>,
+    profiles: Vec<Option<String>>,
+    new_profile_name: Option<String>,
     enrolled: Option<String>,
     dark: bool,
     processing: Processing,
     gains: Gains,
     session: Option<Session>,
     restart: Option<Config>,
-    recording: Option<Recording>,
+    enrollment: Option<Enrollment>,
     measurement_start: Option<Instant>,
     latency: Option<Latency>,
     latency_error: Option<String>,
@@ -188,11 +248,25 @@ impl Desktop {
         };
         let preferred = settings.choices.clone();
         let profile_path = preferences::profile_path().map_err(|error| format!("{error:#}"));
-        let (enrolled, mut notice) = match &profile_path {
-            Ok(path) => match preferences::load_profile(path) {
-                Ok(profile) => (profile.map(|profile| profile.microphone.clone()), None),
-                Err(error) => (None, Some((true, format!("{error:#}")))),
+        let (profiles, profiles_error) = match &profile_path {
+            Ok(path) => match preferences::voice_profiles(path) {
+                Ok(profiles) => (profiles, None),
+                Err(error) => (
+                    Vec::new(),
+                    Some((true, format!("Could not list voice profiles. {error:#}"))),
+                ),
             },
+            Err(_) => (Vec::new(), None),
+        };
+        let (enrolled, mut notice) = match &profile_path {
+            Ok(path) => {
+                match preferences::named_profile_path(path, settings.voice_profile.as_deref())
+                    .and_then(|path| preferences::load_profile(&path))
+                {
+                    Ok(profile) => (profile.map(|profile| profile.microphone.clone()), None),
+                    Err(error) => (None, Some((true, format!("{error:#}")))),
+                }
+            }
             Err(error) => (None, Some((true, error.clone()))),
         };
         let mut resume_until = None;
@@ -226,17 +300,19 @@ impl Desktop {
             choices: preferred.clone(),
             preferred,
             profile_path,
+            profiles,
+            new_profile_name: None,
             enrolled,
             dark,
             processing: settings.processing.clone(),
             gains: settings.gains,
             session: None,
             restart: None,
-            recording: None,
+            enrollment: None,
             measurement_start: None,
             latency: None,
             latency_error: None,
-            notice: notice.or(settings_error),
+            notice: notice.or(profiles_error).or(settings_error),
             input_meter: 0.0,
             output_meter: 0.0,
             meter_time: Instant::now(),
@@ -272,6 +348,9 @@ impl Desktop {
             engine::default_config(self.choices.microphone.clone(), self.choices.cable.clone());
         config.processing = self.processing.clone();
         config.gains = self.gains;
+        config
+            .voice_profile
+            .clone_from(&self.settings.voice_profile);
         config
     }
 
@@ -310,7 +389,8 @@ impl Desktop {
     }
 
     fn can_start(&self) -> bool {
-        self.recording.is_none()
+        self.enrollment.is_none()
+            && self.new_profile_name.is_none()
             && !self.downloading()
             && (self.processing.backend != Backend::Cuda || self.cuda_available)
             && self.selected_profile()
@@ -347,9 +427,10 @@ impl Desktop {
         if let Some(session) = &mut self.session {
             session.stop();
         }
-        if let Some(recording) = &mut self.recording {
-            recording.canceled = true;
-            recording.stop.signal();
+        match self.enrollment.as_mut() {
+            Some(Enrollment::Recording(recording)) => recording.cancel(),
+            Some(Enrollment::Candidate(_)) => self.enrollment = None,
+            _ => {}
         }
         if let Some(UpdateTask::Download { cancel, .. }) = &self.update_task {
             cancel.store(true, Relaxed);
@@ -383,7 +464,7 @@ impl Desktop {
 
     fn installable_update(&self) -> Option<&updates::Release> {
         if self.quitting
-            || self.recording.is_some()
+            || self.enrollment.is_some()
             || self.resume_until.is_some()
             || self.update_task.is_some()
         {
@@ -517,30 +598,196 @@ impl Desktop {
         }
     }
 
-    fn voice_action(&mut self) -> Result<()> {
-        if let Some(recording) = self.recording.as_mut() {
-            recording.canceled = true;
-            recording.stop.signal();
-            return Ok(());
+    fn profile_path(&self) -> Result<PathBuf> {
+        self.profile_path.clone().map_err(anyhow::Error::msg)
+    }
+
+    fn select_voice_profile(&mut self, name: Option<String>) -> Result<()> {
+        let path = preferences::named_profile_path(&self.profile_path()?, name.as_deref())?;
+        let profile =
+            preferences::load_profile(&path)?.context("The selected voice profile is missing.")?;
+        self.set_voice_profile(name, Some(profile.microphone.clone()));
+        self.clear_latency();
+        self.notice = None;
+        Ok(())
+    }
+
+    fn set_voice_profile(&mut self, name: Option<String>, microphone: Option<String>) {
+        self.settings.voice_profile = name;
+        self.enrolled = microphone;
+        if let Some(microphone) = &self.enrolled {
+            self.preferred.microphone.clone_from(microphone);
+            self.settings.choices.microphone.clone_from(microphone);
+            if let Some(devices) = &self.devices {
+                self.choices.microphone =
+                    self.preferred.resolve(devices, Some(microphone)).microphone;
+            }
         }
-        let path = self
-            .profile_path
+        self.resume_until = None;
+        self.settings.resume = false;
+        self.settings_dirty = true;
+        self.save_settings();
+    }
+
+    fn recording_target(&self) -> Result<(PathBuf, Option<String>)> {
+        let new_name = self
+            .new_profile_name
             .as_ref()
-            .map_err(|error| anyhow::anyhow!("{error}"))?
-            .clone();
-        if self.selected_profile() {
-            preferences::delete_profile(&path)?;
-            self.enrolled = None;
-            self.resume_until = None;
-            self.settings.resume = false;
-            self.settings_dirty = true;
-            self.notice = Some((false, "Voice profile removed.".to_owned()));
-            self.save_settings();
-        } else {
-            self.recording = Some(Recording::start(self.choices.microphone.clone(), path)?);
+            .map(|name| name.trim().to_owned());
+        let name = new_name
+            .as_deref()
+            .or(self.settings.voice_profile.as_deref());
+        let path = preferences::named_profile_path(&self.profile_path()?, name)?;
+        Ok((path, new_name))
+    }
+
+    fn enrollment_busy(&self) -> bool {
+        matches!(
+            &self.enrollment,
+            Some(Enrollment::Recording(_) | Enrollment::Saving(_))
+        )
+    }
+
+    fn discard_stale_candidate(&mut self) {
+        if matches!(
+            &self.enrollment,
+            Some(Enrollment::Candidate(profile)) if profile.microphone != self.choices.microphone
+        ) {
+            self.enrollment = None;
+            self.notice = Some((
+                false,
+                "The microphone changed. Record your voice again.".into(),
+            ));
+        }
+    }
+
+    fn selected_mic_available(&self) -> bool {
+        self.devices.as_ref().is_some_and(|devices| {
+            devices
+                .microphones
+                .iter()
+                .any(|device| device.id == self.choices.microphone)
+        })
+    }
+
+    fn can_record(&self) -> bool {
+        !self.quitting
+            && self.session.is_none()
+            && self.resume_until.is_none()
+            && !self.downloading()
+            && self.selected_mic_available()
+    }
+
+    fn record_voice(&mut self, ctx: &egui::Context) -> Result<()> {
+        let (path, new_name) = self.recording_target()?;
+        anyhow::ensure!(
+            new_name.is_none() || !path.try_exists()?,
+            "A voice profile with that name already exists."
+        );
+        let recording = Recording::start(self.choices.microphone.clone(), ctx)?;
+        self.enrollment = Some(Enrollment::Recording(recording));
+        self.notice = None;
+        Ok(())
+    }
+
+    fn keep_voice(&mut self, ctx: &egui::Context) -> Result<()> {
+        let (path, new_name) = self.recording_target()?;
+        if let Some(Enrollment::Candidate(profile)) = self.enrollment.as_ref() {
+            anyhow::ensure!(
+                profile.microphone == self.choices.microphone,
+                "The microphone changed. Record your voice again."
+            );
+            self.enrollment = Some(Enrollment::save(Arc::clone(profile), path, new_name, ctx)?);
             self.notice = None;
         }
         Ok(())
+    }
+
+    fn forget_voice(&mut self) -> Result<()> {
+        let name = self.settings.voice_profile.as_deref();
+        let path = preferences::named_profile_path(&self.profile_path()?, name)?;
+        preferences::delete_profile(&path)?;
+        self.profiles.retain(|profile| profile.as_deref() != name);
+        self.set_voice_profile(None, None);
+        if let Some(next) = self.profiles.first().cloned() {
+            self.select_voice_profile(next)?;
+        }
+        self.notice = Some((false, "Voice profile removed.".to_owned()));
+        Ok(())
+    }
+
+    fn poll_enrollment(&mut self) -> f32 {
+        match &self.enrollment {
+            Some(Enrollment::Recording(recording)) => {
+                let peak = f32::from_bits(recording.level.swap(0, Relaxed));
+                if let Some(result) = recording.result() {
+                    self.enrollment = None;
+                    match result {
+                        Ok(Some(profile))
+                            if profile.microphone == self.choices.microphone
+                                && self.selected_mic_available() =>
+                        {
+                            self.enrollment = Some(Enrollment::Candidate(Arc::new(profile)));
+                        }
+                        Ok(Some(_)) => {
+                            self.notice = Some((
+                                true,
+                                "The selected microphone is unavailable. Reconnect it and record again."
+                                    .into(),
+                            ));
+                        }
+                        Ok(None) => {
+                            self.new_profile_name = None;
+                            self.notice = Some((false, "Recording canceled.".to_owned()));
+                        }
+                        Err(error) => self.report(Err(error)),
+                    }
+                }
+                peak
+            }
+            Some(Enrollment::Saving(done)) => {
+                if let Some(result) =
+                    task_result(done, "The voice profile save task stopped unexpectedly.")
+                {
+                    self.enrollment = None;
+                    match result {
+                        Ok(ProfileSave {
+                            profile,
+                            new_name,
+                            result: Ok(()),
+                        }) => {
+                            let name = new_name.or_else(|| self.settings.voice_profile.clone());
+                            if !self.profiles.contains(&name) {
+                                self.profiles.push(name.clone());
+                                self.profiles.sort_unstable();
+                            }
+                            self.new_profile_name = None;
+                            self.set_voice_profile(name, Some(profile.microphone.clone()));
+                            self.clear_latency();
+                            self.notice =
+                                Some((false, "Voice profile saved on this PC.".to_owned()));
+                        }
+                        Ok(ProfileSave {
+                            profile,
+                            new_name,
+                            result: Err(error),
+                        }) => {
+                            if !self.quitting && profile.microphone == self.choices.microphone {
+                                self.new_profile_name = new_name;
+                                self.enrollment = Some(Enrollment::Candidate(profile));
+                            }
+                            self.notice = Some((
+                                true,
+                                format!("Could not save the voice profile. {error:#}"),
+                            ));
+                        }
+                        Err(error) => self.report(Err(error)),
+                    }
+                }
+                0.0
+            }
+            _ => 0.0,
+        }
     }
 
     fn poll(&mut self, ctx: &egui::Context) -> Status {
@@ -554,8 +801,9 @@ impl Desktop {
                 Ok(devices) => {
                     if self.resume_until.is_none() && self.session.is_none() {
                         let selected = self.preferred.resolve(&devices, self.enrolled.as_deref());
-                        if self.recording.is_none() {
+                        if !self.enrollment_busy() {
                             self.choices.microphone = selected.microphone;
+                            self.discard_stale_candidate();
                         }
                         self.choices.cable = selected.cable;
                     }
@@ -581,29 +829,7 @@ impl Desktop {
                 self.refresh(ctx);
             }
         }
-        let mut recorded_peak = 0.0;
-        if let Some(recording) = self.recording.as_ref() {
-            recorded_peak = f32::from_bits(recording.level.swap(0, Relaxed));
-            if let Ok(result) = recording.done.try_recv() {
-                let canceled = recording.canceled;
-                self.recording = None;
-                match result {
-                    Ok(id) => {
-                        self.preferred.microphone.clone_from(&id);
-                        self.settings.choices.microphone.clone_from(&id);
-                        self.enrolled = Some(id);
-                        self.settings.resume = false;
-                        self.settings_dirty = true;
-                        self.notice = Some((false, "Voice profile saved on this PC.".to_owned()));
-                        self.save_settings();
-                    }
-                    Err(_) if canceled => {
-                        self.notice = Some((false, "Recording canceled.".to_owned()))
-                    }
-                    Err(error) => self.notice = Some((true, format!("{error:#}"))),
-                }
-            }
-        }
+        let recorded_peak = self.poll_enrollment();
         let mut status = Status::default();
         let mut approved = None;
         if let Some(session) = self.session.as_mut() {
@@ -669,7 +895,7 @@ impl Desktop {
         self.input_meter = smooth(self.input_meter, status.input.max(recorded_peak), elapsed);
         self.output_meter = smooth(self.output_meter, status.output, elapsed);
         if self.session.is_some()
-            || self.recording.is_some()
+            || self.enrollment.is_some()
             || self.input_meter > 0.001
             || self.output_meter > 0.001
         {
@@ -707,6 +933,21 @@ impl Desktop {
                     self.settings.dark = self.dark;
                     self.settings_dirty = true;
                     self.save_settings();
+                }
+                if ui
+                    .add_enabled(
+                        self.enrolled.is_some()
+                            && self.session.is_none()
+                            && self.enrollment.is_none()
+                            && self.new_profile_name.is_none()
+                            && !self.downloading(),
+                        egui::Button::new("Forget selected voice profile"),
+                    )
+                    .clicked()
+                {
+                    let result = self.forget_voice();
+                    self.report(result);
+                    ui.close();
                 }
                 if self.installed {
                     let mut enabled = self.startup;
@@ -750,7 +991,7 @@ impl Desktop {
             ui.horizontal(|ui| {
                 ui.strong("AUDIO ROUTING");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let enabled = self.device_update.is_none() && self.recording.is_none();
+                    let enabled = self.device_update.is_none() && self.enrollment.is_none();
                     if ui
                         .add_enabled(enabled, egui::Button::new("Refresh devices"))
                         .clicked()
@@ -766,14 +1007,14 @@ impl Desktop {
                     "Microphone",
                     &devices.microphones,
                     &mut self.choices.microphone,
-                    self.session.is_none() && self.recording.is_none(),
+                    self.session.is_none() && self.enrollment.is_none(),
                 );
                 changed[1] = device_picker(
                     ui,
                     "Virtual cable",
                     &devices.cables,
                     &mut self.choices.cable,
-                    self.recording.is_none()
+                    self.enrollment.is_none()
                         && !self.session.as_ref().is_some_and(Session::stopping),
                 );
             } else {
@@ -901,20 +1142,17 @@ impl Desktop {
     }
 
     fn actions(&mut self, ui: &mut egui::Ui) {
+        self.voice_profiles(ui);
         let stopping = self.session.as_ref().is_some_and(Session::stopping);
         let changed = self.changed();
-        let voice = if let Some(recording) = &self.recording {
-            if recording.canceled {
-                "Canceling…"
-            } else {
-                "Cancel recording"
-            }
-        } else if self.selected_profile() {
-            "Forget voice"
-        } else if self.enrolled.is_some() {
-            "Replace voice profile"
-        } else {
-            "Record voice"
+        let voice = match &self.enrollment {
+            Some(Enrollment::Recording(recording)) if recording.canceled => "Canceling recording",
+            Some(Enrollment::Recording(_)) => "Cancel recording",
+            Some(Enrollment::Candidate(_)) => "Confirm",
+            Some(Enrollment::Saving(_)) => "Saving voice profile",
+            None if self.new_profile_name.is_some() => "Record new voice",
+            None if self.enrolled.is_some() => "Re-record selected voice",
+            None => "Record voice",
         };
         let isolation = if stopping {
             if self.restart.is_some() {
@@ -929,11 +1167,17 @@ impl Desktop {
         } else {
             "Stop isolation"
         };
-        let record_enabled = self.session.is_none()
-            && self.resume_until.is_none()
-            && !self.downloading()
-            && !self.choices.microphone.is_empty()
-            && !self.recording.as_ref().is_some_and(|r| r.canceled);
+        let record_enabled = match &self.enrollment {
+            Some(Enrollment::Recording(recording)) => !recording.canceled,
+            Some(Enrollment::Saving(_)) => false,
+            _ => {
+                self.can_record()
+                    && self
+                        .new_profile_name
+                        .as_ref()
+                        .is_none_or(|name| !name.trim().is_empty())
+            }
+        };
         let isolate_enabled = !stopping && (self.session.is_some() && !changed || self.can_start());
         ui.columns(2, |columns| {
             let width = columns[0].available_width();
@@ -944,7 +1188,15 @@ impl Desktop {
                 )
                 .clicked()
             {
-                let result = self.voice_action();
+                let result = match self.enrollment.as_mut() {
+                    Some(Enrollment::Recording(recording)) => {
+                        recording.cancel();
+                        Ok(())
+                    }
+                    Some(Enrollment::Candidate(_)) => self.keep_voice(columns[0].ctx()),
+                    Some(Enrollment::Saving(_)) => Ok(()),
+                    None => self.record_voice(columns[0].ctx()),
+                };
                 self.report(result);
             }
             let width = columns[1].available_width();
@@ -959,14 +1211,95 @@ impl Desktop {
                 self.isolation_action();
             }
         });
-        if let Some(recording) = &self.recording {
-            ui.add(
-                egui::ProgressBar::new((recording.since.elapsed().as_secs_f32() / 6.0).min(1.0))
+        match &self.enrollment {
+            Some(Enrollment::Recording(recording)) => {
+                ui.add(
+                    egui::ProgressBar::new(
+                        (recording.since.elapsed().as_secs_f32() / 6.0).min(1.0),
+                    )
                     .text("Speak alone at your normal distance"),
-            );
-        } else if changed && !stopping {
-            ui.weak("Processing changes are ready to apply.");
+                );
+            }
+            Some(Enrollment::Candidate(_)) => {
+                ui.weak("Keep this take if you spoke alone at your normal distance.");
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(self.can_record(), egui::Button::new("Retake"))
+                        .clicked()
+                    {
+                        let result = self.record_voice(ui.ctx());
+                        self.report(result);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.enrollment = None;
+                        self.new_profile_name = None;
+                        self.notice = Some((false, "Recording canceled.".to_owned()));
+                    }
+                });
+            }
+            None if changed && !stopping => {
+                ui.weak("Processing changes are ready to apply.");
+            }
+            _ => {}
         }
+    }
+
+    fn voice_profiles(&mut self, ui: &mut egui::Ui) {
+        let enabled = !self.quitting && self.session.is_none() && !self.downloading();
+        let enrollment_busy = self.enrollment_busy();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Voice profile");
+            if let Some(name) = &mut self.new_profile_name {
+                ui.add_enabled(
+                    enabled && !enrollment_busy,
+                    egui::TextEdit::singleline(name)
+                        .hint_text("Profile name")
+                        .char_limit(preferences::MAX_PROFILE_NAME)
+                        .desired_width(168.0),
+                );
+                if self.enrollment.is_none() && ui.button("Cancel").clicked() {
+                    self.new_profile_name = None;
+                }
+                return;
+            }
+            let active = &self.settings.voice_profile;
+            let mut selected = None;
+            let label = if self.enrolled.is_some() {
+                active.as_deref().unwrap_or(preferences::SAVED_VOICE)
+            } else {
+                "Select a profile"
+            };
+            ui.add_enabled_ui(enabled && self.enrollment.is_none(), |ui| {
+                egui::ComboBox::from_id_salt("voice-profile")
+                    .width(168.0)
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        for profile in &self.profiles {
+                            let name = profile.as_deref().unwrap_or(preferences::SAVED_VOICE);
+                            if ui
+                                .selectable_label(
+                                    self.enrolled.is_some() && profile == active,
+                                    name,
+                                )
+                                .clicked()
+                            {
+                                selected = Some(profile.clone());
+                            }
+                        }
+                    });
+                if ui.button("New profile").clicked() {
+                    self.new_profile_name = Some(String::new());
+                    self.resume_until = None;
+                    self.notice = None;
+                }
+            });
+            if let Some(profile) = selected
+                && (self.enrolled.is_none() || profile != self.settings.voice_profile)
+            {
+                let result = self.select_voice_profile(profile);
+                self.report(result);
+            }
+        });
     }
 
     fn latency(&mut self, ui: &mut egui::Ui, status: &Status) {
@@ -1064,7 +1397,7 @@ impl eframe::App for Desktop {
         }
         self.status = self.poll(ctx);
         self.poll_updates(ctx);
-        if self.quitting && self.session.is_none() && self.recording.is_none() {
+        if self.quitting && self.session.is_none() && self.enrollment.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -1126,8 +1459,12 @@ impl eframe::App for Desktop {
                                         },
                                         false,
                                     )
-                                } else if self.recording.is_some() {
+                                } else if matches!(self.enrollment, Some(Enrollment::Recording(_))) {
                                     ("RECORDING", false)
+                                } else if matches!(self.enrollment, Some(Enrollment::Candidate(_))) {
+                                    ("REVIEW RECORDING", false)
+                                } else if matches!(self.enrollment, Some(Enrollment::Saving(_))) {
+                                    ("SAVING PROFILE", false)
                                 } else if self.selected_profile() {
                                     ("VOICE READY", true)
                                 } else {
@@ -1215,6 +1552,21 @@ impl eframe::App for Desktop {
                             status.underruns,
                             status.recoveries
                         ));
+                        if status.render_period_frames != 0 {
+                            let rate = status.short_render_rate.unwrap_or(RATE as u32);
+                            let route = if status.short_render_rate.is_some() {
+                                "Short-period WASAPI"
+                            } else {
+                                "Standard WASAPI"
+                            };
+                            ui.weak(format!(
+                                "{route}  ·  cable period {:.2} ms  ·  device queue {:.1} ms",
+                                f64::from(status.render_period_frames) * 1000.0 / f64::from(rate),
+                                f64::from(status.render_padding_frames) * 1000.0 / f64::from(rate),
+                            )).on_hover_text(format!(
+                                "Cable render format: {rate} Hz. The device queue is sampled before each refill. Sample-rate conversion uses band-limited interpolation."
+                            ));
+                        }
                         if let Some(p99) = status.batch_p99_ms {
                             let percentile = |p99: Option<usize>| match p99 {
                                 Some(63) => "≥63".to_owned(),
@@ -1242,7 +1594,7 @@ impl eframe::App for Desktop {
                     } else if self.resume_until.is_some() {
                         ui.weak("Waiting for the saved microphone and virtual cable…");
                     } else if self.enrolled.is_none()
-                        && self.recording.is_none()
+                        && self.enrollment.is_none()
                         && self.session.is_none()
                     {
                         ui.weak("Select a microphone and record six seconds of your voice.");
@@ -1250,6 +1602,91 @@ impl eframe::App for Desktop {
                 });
         });
         self.save_standby_edits();
+    }
+}
+
+#[cfg(test)]
+mod enrollment_tests {
+    use super::*;
+    use std::{fs, fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+
+    fn profile(microphone: &str, level: f32) -> Profile {
+        Profile {
+            microphone: microphone.into(),
+            samples: vec![level; voiceisolator::PROFILE_SAMPLES],
+        }
+    }
+
+    fn saved_profile(enrollment: Enrollment) -> Result<ProfileSave> {
+        let Enrollment::Saving(done) = enrollment else {
+            panic!("Expected a profile save task");
+        };
+        done.recv_timeout(Duration::from_secs(5))?
+    }
+
+    #[test]
+    fn canceled_recording_discards_completed_take_and_preserves_saved_profile() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("profile.dat");
+        preferences::save_profile(&path, &profile("mic", 0.1))?;
+        let before = fs::read(&path)?;
+        let (send, done) = crossbeam_channel::bounded(1);
+        let mut recording = Recording {
+            stop: Arc::new(Event::new(true)?),
+            level: Arc::new(AtomicU32::new(0)),
+            done,
+            since: Instant::now(),
+            canceled: false,
+        };
+        send.send(Ok(profile("mic", 0.2))).ok().unwrap();
+        recording.cancel();
+        assert!(matches!(recording.result(), Some(Ok(None))));
+        drop(Enrollment::Candidate(Arc::new(profile("mic", 0.3))));
+        assert_eq!(fs::read(&path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn lost_capture_helper_is_reported() -> Result<()> {
+        let (send, done) = crossbeam_channel::bounded(1);
+        let recording = Recording {
+            stop: Arc::new(Event::new(true)?),
+            level: Arc::new(AtomicU32::new(0)),
+            done,
+            since: Instant::now(),
+            canceled: false,
+        };
+        assert!(recording.result().is_none());
+        drop(send);
+        assert!(matches!(recording.result(), Some(Err(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn locked_profile_survives_failed_keep_and_successful_keep_reopens() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("profile.dat");
+        preferences::save_profile(&path, &profile("mic", 0.1))?;
+        let before = fs::read(&path)?;
+        let ctx = egui::Context::default();
+        let locked = OpenOptions::new().read(true).share_mode(1).open(&path)?;
+        let candidate = Arc::new(profile("mic", 0.2));
+        let attempted = saved_profile(Enrollment::save(candidate, path.clone(), None, &ctx)?)?;
+        assert!(attempted.result.is_err());
+        assert_eq!(fs::read(&path)?, before);
+        drop(locked);
+
+        let kept = saved_profile(Enrollment::save(
+            attempted.profile,
+            path.clone(),
+            None,
+            &ctx,
+        )?)?;
+        kept.result?;
+        let reopened = preferences::load_profile(&path)?.unwrap();
+        assert_eq!(reopened.microphone, "mic");
+        assert_eq!(reopened.samples, kept.profile.samples);
+        Ok(())
     }
 }
 

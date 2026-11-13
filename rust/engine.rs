@@ -28,13 +28,14 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE},
-        Media::Audio::{eCapture, eRender},
+        Media::Audio::eCapture,
         System::JobObjects::*,
     },
     core::PCWSTR,
 };
 
 pub const BATCHES: [usize; 4] = [16, 24, 32, 40];
+pub const ENGINE_PROTOCOL: u32 = 3;
 const CONTROL_LIMIT: u64 = 16_384;
 const RECOVERY_WINDOW: Duration = Duration::from_secs(30);
 
@@ -80,6 +81,8 @@ impl Gains {
 pub struct Config {
     pub microphone: String,
     pub cable: String,
+    #[serde(default)]
+    pub voice_profile: Option<String>,
     pub processing: Processing,
     pub gains: Gains,
     pub models: PathBuf,
@@ -105,6 +108,9 @@ pub struct Status {
     pub underruns: usize,
     pub recoveries: usize,
     pub peak_frames: usize,
+    pub render_period_frames: u32,
+    pub render_padding_frames: u32,
+    pub short_render_rate: Option<u32>,
     pub input_pending_frames: usize,
     pub output_pending_frames: usize,
     pub inference_p99_ms: Option<usize>,
@@ -290,7 +296,7 @@ impl Session {
         send(
             &mut session.commands,
             &Control::Start {
-                protocol: 1,
+                protocol: ENGINE_PROTOCOL,
                 config: session.config.clone(),
             },
         )?;
@@ -394,6 +400,9 @@ struct Meters {
     underruns: AtomicUsize,
     recoveries: AtomicUsize,
     peak_frames: AtomicUsize,
+    render_period_frames: AtomicU32,
+    render_padding_frames: AtomicU32,
+    short_render_rate: AtomicU32,
     input_pending_frames: AtomicUsize,
     output_pending_frames: AtomicUsize,
     timing: BatchMetrics,
@@ -467,6 +476,9 @@ impl Meters {
             underruns: self.underruns.load(Relaxed),
             recoveries: self.recoveries.load(Relaxed),
             peak_frames: self.peak_frames.load(Relaxed),
+            render_period_frames: self.render_period_frames.load(Relaxed),
+            render_padding_frames: self.render_padding_frames.load(Relaxed),
+            short_render_rate: Some(self.short_render_rate.load(Relaxed)).filter(|&rate| rate != 0),
             input_pending_frames: self.input_pending_frames.load(Relaxed),
             output_pending_frames: self.output_pending_frames.load(Relaxed),
             inference_p99_ms: self.timing.inference.p99_ms(),
@@ -500,7 +512,7 @@ pub fn run_child() -> Result<()> {
     let mut reader = BufReader::new(io::stdin());
     let mut buffer = Vec::new();
     let Some(Control::Start {
-        protocol: 1,
+        protocol: ENGINE_PROTOCOL,
         config,
     }) = receive(&mut reader, &mut buffer)?
     else {
@@ -699,7 +711,11 @@ impl RouteRecovery {
 }
 
 fn run_audio(config: &Config, shared: &Shared, tap: &Tap) -> Result<()> {
-    let profile = preferences::load_profile(&preferences::profile_path()?)?
+    let path = preferences::named_profile_path(
+        &preferences::profile_path()?,
+        config.voice_profile.as_deref(),
+    )?;
+    let profile = preferences::load_profile(&path)?
         .context("Record your voice before starting isolation.")?;
     ensure!(
         profile.microphone == config.microphone,
@@ -726,10 +742,19 @@ fn run_audio(config: &Config, shared: &Shared, tap: &Tap) -> Result<()> {
     shared.meters.heartbeat.fetch_add(1, Relaxed);
     shared.meters.model_ready.store(true, Release);
     let mut recovery = RouteRecovery::default();
+    let mut prefer_short_period = true;
     while !shared.stopped.load(Relaxed) {
         let start = Instant::now();
         shared.meters.batch_ms.store(batch_ms, Relaxed);
-        let result = generation(config, shared, &mut model, tap, batch_ms, &max_batch_ms);
+        let result = generation(
+            config,
+            shared,
+            &mut model,
+            tap,
+            batch_ms,
+            &max_batch_ms,
+            prefer_short_period,
+        );
         shared.meters.live.store(false, Relaxed);
         if shared.stopped.load(Relaxed) {
             return Ok(());
@@ -737,19 +762,23 @@ fn run_audio(config: &Config, shared: &Shared, tap: &Tap) -> Result<()> {
         let error = result.err().context("Audio route stopped unexpectedly")?;
         let now = Instant::now();
         let limit = max_batch_ms.load(Relaxed);
-        let retry_ms = if (processing.batch_ms..batch_ms).contains(&limit) {
-            // Reopening a device can change its audio period.
-            batch_ms = limit;
-            recovery = RouteRecovery::default();
-            0
-        } else if let Some(larger) =
-            recovery.larger_cpu_batch(processing.backend, batch_ms, limit, now, &error)
-        {
-            batch_ms = larger;
-            0
-        } else {
-            recovery.retry_delay(start, now, error)?
-        };
+        let retry_ms =
+            if shared.meters.short_render_rate.load(Relaxed) != 0 && error.is::<RenderFault>() {
+                prefer_short_period = false;
+                0
+            } else if (processing.batch_ms..batch_ms).contains(&limit) {
+                // Reopening a device can change its audio period.
+                batch_ms = limit;
+                recovery = RouteRecovery::default();
+                0
+            } else if let Some(larger) =
+                recovery.larger_cpu_batch(processing.backend, batch_ms, limit, now, &error)
+            {
+                batch_ms = larger;
+                0
+            } else {
+                recovery.retry_delay(start, now, error)?
+            };
         shared.meters.recoveries.fetch_add(1, Relaxed);
         shared.meters.heartbeat.fetch_add(1, Relaxed);
         let _ = wasapi::wait([&shared.stop], retry_ms)?;
@@ -765,6 +794,17 @@ fn run_audio(config: &Config, shared: &Shared, tap: &Tap) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct RenderFault;
+
+impl fmt::Display for RenderFault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("The selected virtual cable stopped accepting audio.")
+    }
+}
+
+impl std::error::Error for RenderFault {}
+
 fn generation(
     config: &Config,
     shared: &Shared,
@@ -772,6 +812,7 @@ fn generation(
     tap: &Tap,
     batch_ms: usize,
     max_batch_ms: &AtomicUsize,
+    prefer_short_period: bool,
 ) -> Result<()> {
     let batch = batch_ms * RATE / 1000;
     let budget = Duration::from_millis(batch_ms as u64);
@@ -793,14 +834,27 @@ fn generation(
             let mut playback = playback;
             let mut partial_batch = 0;
             let result = (|| -> Result<()> {
+                shared.meters.render_period_frames.store(0, Relaxed);
+                shared.meters.render_padding_frames.store(0, Relaxed);
+                shared.meters.short_render_rate.store(0, Relaxed);
                 let _com = Com::init()?;
                 let devices = wasapi::enumerator()?;
                 let mut capture = Stream::open(&devices, &config.microphone, eCapture, false)
                     .context("Open the selected microphone")?;
-                let mut render = Stream::open(&devices, &config.cable, eRender, true)
+                let mut render = Stream::open_render(&devices, &config.cable, prefer_short_period)
                     .context("Open the selected virtual cable")?;
+                let short_rate = render.short_render_rate();
+                let render_rate = short_rate.unwrap_or(RATE);
+                shared
+                    .meters
+                    .short_render_rate
+                    .store(short_rate.unwrap_or(0) as u32, Relaxed);
                 let capture_period = capture.period()?;
                 let render_period = render.period()?;
+                shared
+                    .meters
+                    .render_period_frames
+                    .store(render_period as u32, Relaxed);
                 if config.processing.backend == Backend::Cpu {
                     let max_batch = BATCHES.into_iter().rev().find(|&size| {
                         playback
@@ -809,22 +863,30 @@ fn generation(
                                 capture_period,
                                 render_period,
                                 render.capacity,
+                                render_rate,
                             )
                             .is_some()
                     });
                     max_batch_ms.store(max_batch.unwrap_or(0), Relaxed);
                 }
                 let padding = playback
-                    .configure(batch, capture_period, render_period, render.capacity)
+                    .configure(
+                        batch,
+                        capture_period,
+                        render_period,
+                        render.capacity,
+                        render_rate,
+                    )
                     .context("The Windows audio periods are too large for live isolation.")?;
-                render_period_ms.store((render_period * 1000).div_ceil(RATE) as u32, Relaxed);
-                render.render(padding, |_| false)?;
+                render_period_ms
+                    .store((render_period * 1000).div_ceil(render_rate) as u32, Relaxed);
+                render.render(padding, |_| false).context(RenderFault)?;
                 let _priority = AudioPriority::register();
                 if wasapi::wait([&shared.stop, &terminate], 0)?.is_some() {
                     return Ok(());
                 }
                 capture.start()?;
-                render.start()?;
+                render.start().context(RenderFault)?;
                 let mut last = [Instant::now(); 2];
                 loop {
                     match wasapi::wait(
@@ -889,16 +951,23 @@ fn generation(
                                     }
                                     fill.produced > 0
                                 })
-                                .context("Write to the selected virtual cable")?;
+                                .map(|frames| {
+                                    shared
+                                        .meters
+                                        .render_padding_frames
+                                        .store(frames as u32, Relaxed)
+                                })
+                                .context(RenderFault)?;
                             last[1] = Instant::now();
                         }
                         _ => bail!("Windows audio stopped responding."),
                     }
+                    let timeout = Duration::from_millis(1500);
                     ensure!(
-                        last.iter()
-                            .all(|t| t.elapsed() < Duration::from_millis(1500)),
-                        "The microphone or cable stopped responding."
+                        last[0].elapsed() < timeout,
+                        "The microphone stopped responding."
                     );
+                    ensure!(last[1].elapsed() < timeout, RenderFault);
                 }
             })();
             fault.signal();
@@ -1143,6 +1212,7 @@ pub fn default_config(microphone: String, cable: String) -> Config {
     Config {
         microphone,
         cable,
+        voice_profile: None,
         processing: Processing::default(),
         gains: Gains::default(),
         models: default_models(),

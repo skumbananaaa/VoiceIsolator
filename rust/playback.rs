@@ -168,6 +168,8 @@ fn kernels() -> &'static Kernels {
 
 pub struct Playback {
     prefill: usize,
+    render_rate: usize,
+    correction: Correction,
     kernels: Option<&'static Kernels>,
     position: f64,
     filtered: f64,
@@ -185,7 +187,9 @@ impl Playback {
     pub fn new(correction: Correction) -> Self {
         Self {
             prefill: 0,
-            kernels: (correction == Correction::BandLimited).then(kernels),
+            render_rate: RATE,
+            correction,
+            kernels: None,
             position: 0.0,
             filtered: 0.0,
             primed: false,
@@ -206,7 +210,13 @@ impl Playback {
         capture_period: usize,
         render_period: usize,
         capacity: usize,
+        render_rate: usize,
     ) -> Option<usize> {
+        self.render_rate = render_rate;
+        // Format conversion must suppress images above the model's bandwidth.
+        // Use the same interpolator for conversion and clock correction.
+        self.kernels =
+            (render_rate != RATE || self.correction == Correction::BandLimited).then(kernels);
         let padding = capacity.min(2 * render_period);
         let margin = if batch < RATE * 32 / 1000 {
             RATE * 4 / 1000
@@ -221,7 +231,7 @@ impl Playback {
 
     fn prime_frames(&self, frames: usize) -> usize {
         // Include the maximum drift correction and the interpolation lookahead.
-        frames + frames.div_ceil(1000) + self.lookahead()
+        (frames * RATE * 1001).div_ceil(self.render_rate * 1000) + self.lookahead()
     }
 
     fn interpolate(&self, samples: &Read<'_>, i: usize, fraction: f64) -> f32 {
@@ -254,8 +264,14 @@ impl Playback {
             self.primed = true;
             self.filtered = pending as f64;
         }
-        self.filtered += 0.02 * (pending as f64 - self.filtered);
-        let rate = 1.0 + ((self.filtered - self.prefill as f64) * 0.000004).clamp(-0.001, 0.001);
+        let weight = if self.render_rate == RATE {
+            0.02
+        } else {
+            (2.0 * output.len() as f64 / self.render_rate as f64).min(1.0)
+        };
+        self.filtered += weight * (pending as f64 - self.filtered);
+        let drift = ((self.filtered - self.prefill as f64) * 0.000004).clamp(-0.001, 0.001);
+        let rate = (1.0 + drift) * RATE as f64 / self.render_rate as f64;
         let mut position = self.position;
         let mut produced = 0;
         for sample in output.iter_mut() {
@@ -313,7 +329,7 @@ mod tests {
         for correction in [Correction::Linear, Correction::BandLimited] {
             let mut player = Playback::new(correction);
             let (mut tx, mut rx) = ring();
-            assert_eq!(player.configure(256, 160, 160, 640), Some(320));
+            assert_eq!(player.configure(256, 160, 160, 640, RATE), Some(320));
             let mut output = [0.0; 160];
             assert!(!player.fill(&mut rx, &mut output).primed);
             assert!(tx.push(Some(&[0.25; 600]), 600));
@@ -329,7 +345,7 @@ mod tests {
             for ppm in [-500.0, 500.0] {
                 let mut player = Playback::new(correction);
                 let (mut tx, mut rx) = ring();
-                assert!(player.configure(256, 160, 160, 640).is_some());
+                assert!(player.configure(256, 160, 160, 640, RATE).is_some());
                 let mut output = [0.0; 160];
                 let mut generated = 0;
                 let mut primed = false;
@@ -353,11 +369,44 @@ mod tests {
     }
 
     #[test]
+    fn short_period_playback_converts_to_the_cable_rate_without_draining_early() {
+        for rate in [44_100, 48_000] {
+            let mut player = Playback::new(Correction::Linear);
+            let (mut tx, mut rx) = ring();
+            let period = rate / 200;
+            let mut output = vec![0.0; period];
+            assert_eq!(
+                player.configure(256, 160, period, 2 * period, rate),
+                Some(2 * period)
+            );
+            assert_eq!(player.prefill, 544);
+            let mut generated = 0;
+            let mut played = 0;
+            for tick in 1..=400 {
+                let due = tick * period * RATE / rate;
+                while generated + 256 <= due {
+                    assert!(tx.push(Some(&[0.25; 256]), 256));
+                    generated += 256;
+                }
+                let fill = player.fill(&mut rx, &mut output);
+                assert!(!fill.underrun);
+                if fill.primed {
+                    assert_eq!(fill.produced, period);
+                    assert!(output.iter().all(|s| (s - 0.25).abs() < 1e-6));
+                }
+                played += fill.produced;
+            }
+            assert!(played > rate);
+            assert!(generated.abs_diff(played * RATE / rate + rx.pending()) < 64);
+        }
+    }
+
+    #[test]
     fn partial_burst_lets_playback_reach_prefill_without_growing_ring() {
         for correction in [Correction::Linear, Correction::BandLimited] {
             let mut player = Playback::new(correction);
             let (mut tx, mut rx) = ring();
-            assert_eq!(player.configure(640, 320, 160, 640), Some(320));
+            assert_eq!(player.configure(640, 320, 160, 640, RATE), Some(320));
             assert_eq!(player.prefill, 960);
             let mut output = [0.0; 160];
             assert!(tx.push(Some(&[0.25; 256]), 256));
